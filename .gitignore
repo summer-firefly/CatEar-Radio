@@ -37,3 +37,8 @@ src-tauri/gen/android/.gradle/
 src-tauri/gen/android/**/build/
 src-tauri/gen/android/**/.kotlin/
 src-tauri/gen/android/app/src/main/jniLibs/
+
+# Android signing keys (local only)
+src-tauri/android-signing/
+
+src-tauri/icons/ios/
