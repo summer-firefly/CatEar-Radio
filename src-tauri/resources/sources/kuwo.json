@@ -1,0 +1,6 @@
+{
+  "id": "kuwo",
+  "label": "酷我",
+  "driver": "kuwo",
+  "baseUrl": "https://oiapi.net/api/Kuwo"
+}

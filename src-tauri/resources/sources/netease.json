@@ -1,0 +1,6 @@
+{
+  "id": "netease",
+  "label": "网易云",
+  "driver": "netease",
+  "baseUrl": "https://api.qijieya.cn/meting/"
+}

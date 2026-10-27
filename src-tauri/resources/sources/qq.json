@@ -1,0 +1,6 @@
+{
+  "id": "qq",
+  "label": "QQ",
+  "driver": "qq",
+  "baseUrl": "https://tang.api.s01s.cn/music_open_api.php"
+}
