@@ -6,6 +6,7 @@ import logoUrl from "./assets/logo.png";
 import { formatTime, parseLrc } from "./lrc";
 import type {
   AppSettings,
+  DownloadDirPreset,
   LibrarySnapshot,
   LyricLine,
   PlayMode,
@@ -14,6 +15,13 @@ import type {
   TabId,
   Track,
 } from "./types";
+
+function isAndroid(): boolean {
+  return (
+    document.documentElement.classList.contains("is-android") ||
+    /android/i.test(navigator.userAgent || "")
+  );
+}
 
 type DesktopLyricPayload = {
   line: string;
@@ -82,7 +90,9 @@ const state = {
     | null
     | { kind: "new-playlist" }
     | { kind: "delete-playlist"; id: string; name: string }
-    | { kind: "add-to-playlist"; trackUid: string },
+    | { kind: "add-to-playlist"; trackUid: string }
+    | { kind: "pick-download-dir"; options: DownloadDirPreset[] },
+  downloadDirPresets: [] as DownloadDirPreset[],
   /** Custom track context menu (native WebView menu only has Reload). */
   contextMenu: null as null | { x: number; y: number; trackUid: string; queueKey: string },
 };
@@ -229,6 +239,9 @@ async function boot() {
       sourcesDir: state.settings.sourcesDir ?? "",
       enabledSources: state.settings.enabledSources ?? [],
     };
+    if (isAndroid()) {
+      void ensureDownloadDirPresets();
+    }
   } catch (e) {
     console.error(e);
   }
@@ -582,7 +595,30 @@ async function saveSettings(next: AppSettings) {
   render();
 }
 
+async function ensureDownloadDirPresets(): Promise<DownloadDirPreset[]> {
+  if (state.downloadDirPresets.length) return state.downloadDirPresets;
+  try {
+    state.downloadDirPresets = await invoke<DownloadDirPreset[]>("list_download_dir_presets");
+  } catch (e) {
+    console.error(e);
+    state.downloadDirPresets = [];
+  }
+  return state.downloadDirPresets;
+}
+
 async function pickDownloadDir() {
+  // Android / iOS: Tauri dialog has no folder picker — offer app-scoped presets.
+  if (isAndroid()) {
+    const options = await ensureDownloadDirPresets();
+    if (!options.length) {
+      toast("暂无可用下载目录");
+      return;
+    }
+    state.dialog = { kind: "pick-download-dir", options };
+    render();
+    return;
+  }
+
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
@@ -598,6 +634,13 @@ async function pickDownloadDir() {
   } catch (e) {
     toast(`选择目录失败：${String(e)}`);
   }
+}
+
+async function applyDownloadDirPreset(path: string) {
+  state.dialog = null;
+  const input = document.querySelector<HTMLInputElement>("#download-dir-input");
+  if (input) input.value = path;
+  await saveSettings({ ...state.settings, downloadDir: path });
 }
 
 async function reloadSources() {
@@ -833,6 +876,29 @@ function renderDialog(): string {
                   <span class="dialog-list-meta">${already ? "已在歌单" : `${p.tracks.length} 首`}</span>
                 </button>`;
               })
+              .join("")}
+          </div>
+          <div class="dialog-actions">
+            <button class="btn ghost sm" type="button" id="dialog-cancel">取消</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  if (d.kind === "pick-download-dir") {
+    return `
+      <div class="dialog-backdrop" id="dialog-backdrop">
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+          <h3 id="dialog-title">选用下载目录</h3>
+          <p class="dialog-msg">手机系统不支持文件夹选择器，请选择应用可用目录：</p>
+          <div class="dialog-list">
+            ${d.options
+              .map(
+                (o) => `
+              <button class="dialog-list-item" type="button" data-pick-download-dir="${escapeAttr(o.path)}">
+                <span class="dialog-list-name">${escapeHtml(o.label)}</span>
+                <span class="dialog-list-meta path-meta">${escapeHtml(o.path)}</span>
+              </button>`,
+              )
               .join("")}
           </div>
           <div class="dialog-actions">
@@ -1113,6 +1179,7 @@ function renderSettings(): string {
   const enabled = new Set(state.settings.enabledSources);
   const downloadDir =
     state.settings.downloadDir.trim() || state.defaultDownloadDir || "~/Music/猫耳收音机";
+  const android = isAndroid();
   return `
     <h1 class="page-title page-title-sm">设置</h1>
     <div class="settings-stack">
@@ -1147,9 +1214,14 @@ function renderSettings(): string {
       <div class="settings-card">
         <h3>下载路径</h3>
         <div class="path-row">
-          <input class="field-input path-input" id="download-dir-input" type="text" value="${escapeAttr(state.settings.downloadDir)}" placeholder="${escapeAttr(downloadDir)}" />
-          <button class="btn ghost sm" id="btn-pick-download-dir" type="button">选择</button>
+          <input class="field-input path-input" id="download-dir-input" type="text" value="${escapeAttr(state.settings.downloadDir)}" placeholder="${escapeAttr(downloadDir)}" ${android ? "readonly" : ""} />
+          <button class="btn ghost sm" id="btn-pick-download-dir" type="button">${android ? "选用" : "选择"}</button>
         </div>
+        ${
+          android
+            ? `<p class="settings-hint">手机端无法打开系统文件夹选择器，请从应用可用目录中选用。</p>`
+            : ""
+        }
       </div>
       <button class="btn sm" id="btn-save-settings">保存设置</button>
     </div>
@@ -1684,6 +1756,13 @@ function bindOverlayEvents() {
       const d = state.dialog;
       if (d?.kind !== "add-to-playlist") return;
       void addTrackToPlaylist(btn.dataset.pickPlaylist!, d.trackUid);
+    });
+  });
+  document.querySelectorAll<HTMLElement>("[data-pick-download-dir]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const path = btn.dataset.pickDownloadDir || "";
+      if (!path) return;
+      void applyDownloadDirPreset(path);
     });
   });
   dialogInput?.addEventListener("keydown", (e) => {

@@ -5,7 +5,10 @@ use tauri::{AppHandle, State};
 use crate::model::{
     AppSettings, LibrarySnapshot, RecommendCatalog, SourceInfo, StoredPlaylist, Track,
 };
-use crate::paths::{default_download_dir, resolve_download_dir, resolve_sources_dir};
+use crate::paths::{
+    default_download_dir, download_dir_presets, resolve_download_dir, resolve_sources_dir,
+    DownloadDirPreset,
+};
 use crate::source::{
     ensure_builtin_sources, MusicSources, SourceManifest, SourceRegistry,
 };
@@ -256,7 +259,7 @@ pub async fn ensure_playable(
     track: Track,
 ) -> Result<Track, String> {
     let settings = state.settings.get();
-    let dir = resolve_download_dir(&settings);
+    let dir = resolve_download_dir(&app, &settings);
 
     // Local download wins over network / cache audio URL.
     if let Some(local) = find_local_audio(&dir, &track) {
@@ -351,8 +354,13 @@ pub fn import_library(state: State<'_, AppState>, json: String) -> Result<(), St
 }
 
 #[tauri::command]
-pub fn get_default_download_dir() -> String {
-    default_download_dir().to_string_lossy().into_owned()
+pub fn get_default_download_dir(app: AppHandle) -> String {
+    default_download_dir(&app).to_string_lossy().into_owned()
+}
+
+#[tauri::command]
+pub fn list_download_dir_presets(app: AppHandle) -> Vec<DownloadDirPreset> {
+    download_dir_presets(&app)
 }
 
 #[tauri::command]
@@ -362,7 +370,7 @@ pub async fn download_track(
     track: Track,
 ) -> Result<String, String> {
     let settings = state.settings.get();
-    let dir = resolve_download_dir(&settings);
+    let dir = resolve_download_dir(&app, &settings);
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录：{e}"))?;
 
     let (_, sources) = load_sources(&app, &settings);

@@ -40,10 +40,17 @@ export interface RecommendCatalog {
 export interface AppSettings {
   enabledSources: MusicSourceId[];
   limitPerSource: number;
-  /** Absolute download directory; empty uses ~/Music/猫耳收音机 */
+  /** Absolute download directory; empty uses platform music/download default */
   downloadDir: string;
   /** Directory of `*.json` source manifests; empty uses app data sources/ */
   sourcesDir: string;
+}
+
+/** Preset download locations (used on Android where folder picker is unavailable). */
+export interface DownloadDirPreset {
+  id: string;
+  label: string;
+  path: string;
 }
 
 export interface StoredPlaylist {

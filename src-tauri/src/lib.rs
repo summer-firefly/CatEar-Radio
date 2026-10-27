@@ -82,6 +82,7 @@ pub fn run() {
             commands::export_library,
             commands::import_library,
             commands::get_default_download_dir,
+            commands::list_download_dir_presets,
             commands::download_track,
         ])
         .run(tauri::generate_context!())

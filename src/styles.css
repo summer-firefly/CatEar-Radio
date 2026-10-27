@@ -603,6 +603,29 @@ button {
   font-size: 0.9rem;
 }
 
+.settings-hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.dialog-list-item:has(.path-meta) {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.dialog-list-meta.path-meta {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.68rem;
+  opacity: 0.85;
+  word-break: break-all;
+}
+
 .dialog-list-meta {
   color: var(--muted);
   font-size: 0.75rem;
