@@ -197,7 +197,19 @@ function isAbortError(e: unknown): boolean {
   );
 }
 
+function applyPlatformChrome() {
+  const ua = navigator.userAgent || "";
+  const android = /android/i.test(ua);
+  document.documentElement.classList.toggle("is-android", android);
+  // Edge-to-edge WebViews often report 0 safe-area; keep a modest status/nav fallback.
+  if (android) {
+    document.documentElement.style.setProperty("--sat-fallback", "32px");
+    document.documentElement.style.setProperty("--sab-fallback", "18px");
+  }
+}
+
 async function boot() {
+  applyPlatformChrome();
   // Kill the default WebView menu (only "Reload") — we show our own on tracks.
   document.addEventListener("contextmenu", (e) => {
     e.preventDefault();
