@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>桌面歌词</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div class="dl-root" id="dl-root">
+      <button type="button" class="dl-tool" style="left:10px" data-act="font-down" title="字体减小">A−</button>
+      <button type="button" class="dl-tool" style="left:42px" data-act="font-up" title="字体加大">A+</button>
+      <button type="button" class="dl-tool" style="left:74px" data-act="win-down" title="窗口缩小">⤡</button>
+      <button type="button" class="dl-tool" style="left:106px" data-act="win-up" title="窗口放大">⤢</button>
+      <button type="button" class="dl-tool" style="left:138px" data-act="toggle-next" id="btn-toggle-next" title="显示/隐藏下一句">≡</button>
+      <button type="button" class="dl-tool danger" style="right:10px" data-act="close" title="关闭桌面歌词">✕</button>
+
+      <div class="dl-text">
+        <div class="dl-line" id="dl-line">播放歌曲后显示歌词</div>
+        <div class="dl-next" id="dl-next"></div>
+      </div>
+    </div>
+
+    <div class="dl-edge n" data-resize="North"></div>
+    <div class="dl-edge s" data-resize="South"></div>
+    <div class="dl-edge e" data-resize="East"></div>
+    <div class="dl-edge w" data-resize="West"></div>
+    <div class="dl-edge ne" data-resize="NorthEast"></div>
+    <div class="dl-edge nw" data-resize="NorthWest"></div>
+    <div class="dl-edge se" data-resize="SouthEast"></div>
+    <div class="dl-edge sw" data-resize="SouthWest"></div>
+
+    <script type="module" src="/src/desktop-lyrics.ts"></script>
+  </body>
+</html>
