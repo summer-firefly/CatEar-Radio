@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::model::{
@@ -236,16 +237,20 @@ pub async fn search_tracks(
     keyword: String,
     page: Option<u32>,
     reset: Option<bool>,
+    limit_per_source: Option<u32>,
 ) -> Result<Vec<Track>, String> {
     let settings = state.settings.get();
     let (_, sources) = load_sources(&app, &settings);
+    let limit = limit_per_source
+        .unwrap_or(settings.limit_per_source)
+        .clamp(1, 30);
     state
         .music
         .search(
             &sources,
             &keyword,
             &settings.enabled_sources,
-            settings.limit_per_source,
+            limit,
             page.unwrap_or(1),
             reset.unwrap_or(true),
         )
@@ -363,18 +368,40 @@ pub fn list_download_dir_presets(app: AppHandle) -> Vec<DownloadDirPreset> {
     download_dir_presets(&app)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadResult {
+    pub path: String,
+    pub already_exists: bool,
+}
+
 #[tauri::command]
 pub async fn download_track(
     app: AppHandle,
     state: State<'_, AppState>,
     track: Track,
-) -> Result<String, String> {
+) -> Result<DownloadResult, String> {
     let settings = state.settings.get();
     let dir = resolve_download_dir(&app, &settings);
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录：{e}"))?;
 
+    if let Some(existing) = find_local_audio(&dir, &track) {
+        return Ok(DownloadResult {
+            path: existing.to_string_lossy().into_owned(),
+            already_exists: true,
+        });
+    }
+
     let (_, sources) = load_sources(&app, &settings);
     let detailed = state.music.ensure_playable(&sources, track).await;
+
+    if let Some(existing) = find_local_audio(&dir, &detailed) {
+        return Ok(DownloadResult {
+            path: existing.to_string_lossy().into_owned(),
+            already_exists: true,
+        });
+    }
+
     let url = detailed
         .audio_url
         .as_deref()
@@ -406,5 +433,8 @@ pub async fn download_track(
     let ext = guess_ext(url);
     let path = unique_path(&dir, &stem, ext);
     std::fs::write(&path, &bytes).map_err(|e| format!("写入文件失败：{e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+    Ok(DownloadResult {
+        path: path.to_string_lossy().into_owned(),
+        already_exists: false,
+    })
 }
