@@ -190,6 +190,10 @@ button {
   color: #fff;
   font-weight: 700;
   box-shadow: 0 0 0 1px rgba(180, 217, 255, 0.25) inset;
+}
+
+.nav button.soft-pop,
+.track-row.soft-pop {
   animation: soft-pop 0.42s var(--ease-spring) both;
 }
 
@@ -264,6 +268,10 @@ button {
   gap: 8px;
   position: relative;
   z-index: 20;
+}
+
+.topbar .search-row #btn-search {
+  min-width: 4.8em;
 }
 
 .topbar .search-field {
@@ -443,6 +451,26 @@ button {
 .section-head .hint {
   color: var(--muted);
   font-size: 0.78rem;
+}
+
+.pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.pager-indicator {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  min-width: 3.6em;
+  text-align: center;
+}
+
+.pager .btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .btn {
@@ -968,10 +996,14 @@ button {
   transform: scale(0.985);
 }
 
+/* Action buttons (+ / download / fav) should not bounce the whole row. */
+.track-row:has(.row-actions:active):active {
+  transform: none;
+}
+
 .track-row.active {
   background: var(--accent-dim);
   box-shadow: 0 0 0 1px rgba(180, 217, 255, 0.2) inset;
-  animation: soft-pop 0.4s var(--ease-spring) both;
 }
 
 .track-row.active:hover {
@@ -1054,17 +1086,16 @@ button {
   transition:
     color 0.2s var(--ease-out),
     background 0.2s var(--ease-out),
-    transform 0.32s var(--ease-spring);
+    opacity 0.15s var(--ease-out);
 }
 
 .fav-btn:hover {
   color: #ff9eb5;
   background: rgba(255, 158, 181, 0.15);
-  transform: scale(1.12);
 }
 
 .fav-btn:active {
-  transform: scale(0.88);
+  opacity: 0.7;
 }
 
 .fav-btn.is-fav {
@@ -1197,14 +1228,31 @@ button {
 }
 
 .lyrics {
+  position: relative;
   flex: 1;
   overflow: auto;
   text-align: center;
-  padding: 8px 16px 24px;
+  padding: 0 16px;
   color: var(--muted);
   font-size: 0.9rem;
-  line-height: 2.05;
+  line-height: 1.55;
   mask-image: linear-gradient(180deg, transparent, #000 10%, #000 90%, transparent);
+}
+
+/* Spacers so the first / last lines can sit in the vertical center. */
+.lyrics::before,
+.lyrics::after {
+  content: "";
+  display: block;
+  height: 42%;
+  pointer-events: none;
+}
+
+.lyrics > div {
+  display: block;
+  padding: 0.42em 0.35em;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .lyrics .active-line {
@@ -1317,6 +1365,41 @@ button {
   gap: 6px;
   color: var(--muted);
   font-size: 0.78rem;
+  min-width: 0;
+}
+
+.volume-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-right: 4px;
+}
+
+.volume-mute {
+  width: 32px;
+  height: 32px;
+  font-size: 0.95rem;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.volume-mute:hover {
+  color: var(--ink);
+}
+
+.volume-mute .vol-ico {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+.volume {
+  width: 88px;
+  max-width: 22vw;
+  height: 4px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .mode-btn {
@@ -1760,9 +1843,17 @@ textarea.import-box {
     grid-template-columns: 1fr auto;
   }
 
-  .player-extra,
+  .player-extra .mode-btn,
   .time-row {
     display: none;
+  }
+
+  .player-extra {
+    justify-content: flex-end;
+  }
+
+  .volume {
+    width: 72px;
   }
 }
 
@@ -1770,7 +1861,7 @@ textarea.import-box {
 @media (max-width: 720px) {
   :root {
     --sidebar-w: 0px;
-    --player-h: 64px;
+    --player-h: 92px;
     --topbar-h: 52px;
     --tabbar-h: 56px;
     --card-radius: 12px;
@@ -1946,13 +2037,49 @@ textarea.import-box {
 
   .player-dock {
     grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px;
-    padding: 0 10px;
+    grid-template-rows: auto auto;
+    gap: 4px 8px;
+    padding: 6px 10px 4px;
   }
 
   .player-now {
+    grid-column: 1;
+    grid-row: 1;
     grid-template-columns: 44px minmax(0, 1fr) auto;
     gap: 8px;
+  }
+
+  .player-controls {
+    grid-column: 2;
+    grid-row: 1;
+    align-items: flex-end;
+  }
+
+  .player-extra {
+    display: flex;
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: stretch;
+    padding: 0 2px 2px;
+  }
+
+  .player-extra .mode-btn {
+    display: none;
+  }
+
+  .volume-row {
+    flex: 1;
+    margin-right: 0;
+  }
+
+  .volume {
+    flex: 1;
+    width: auto;
+    max-width: none;
+  }
+
+  .time-row {
+    display: none;
   }
 
   .player-now .cover {
@@ -1973,15 +2100,6 @@ textarea.import-box {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-
-  .player-controls {
-    align-items: flex-end;
-  }
-
-  .player-extra,
-  .time-row {
-    display: none;
   }
 
   .icon-btn {

@@ -11,6 +11,7 @@ import type {
   LyricLine,
   PlayMode,
   RecommendCatalog,
+  RecommendPlaylist,
   SourceInfo,
   TabId,
   Track,
@@ -50,6 +51,26 @@ const SOURCE_LABEL: Record<string, string> = {
   kuwo: "酷我",
 };
 
+const VOLUME_KEY = "maoer-volume";
+
+function loadVolume(): number {
+  try {
+    const v = Number(localStorage.getItem(VOLUME_KEY));
+    if (!Number.isFinite(v)) return 0.85;
+    return Math.min(1, Math.max(0, v));
+  } catch {
+    return 0.85;
+  }
+}
+
+function persistVolume(v: number) {
+  try {
+    localStorage.setItem(VOLUME_KEY, String(v));
+  } catch {
+    /* ignore quota */
+  }
+}
+
 const state = {
   tab: "discover" as TabId,
   keyword: "",
@@ -76,13 +97,23 @@ const state = {
   preparing: false,
   position: 0,
   duration: 0,
+  volume: loadVolume(),
+  muted: false,
+  volumeBeforeMute: loadVolume(),
   playMode: "list" as PlayMode,
   lyrics: [] as LyricLine[],
   lyricsOpen: false,
   desktopLyrics: false,
   toast: "",
   page: 1,
+  /** Whether a newer search page likely exists (based on last page size). */
+  searchHasMore: false,
   searchHistoryOpen: false,
+  /** Client-side pages for local lists (hot / favorites / recommend playlist browse). */
+  hotPage: 1,
+  favPage: 1,
+  browsePlaylistId: null as string | null,
+  browsePage: 1,
   /** One-shot enter animation after a full recommend reload. */
   recommendReveal: false,
   /** In-app dialog — WKWebView has no window.prompt/confirm. */
@@ -162,8 +193,172 @@ function attachSearchHistoryDocHandler() {
 
 const audio = new Audio();
 audio.preload = "metadata";
+audio.volume = state.volume;
 // Do not set crossOrigin: many music CDNs omit CORS headers, which makes
 // HTMLMediaElement.play() reject with NotSupportedError in WKWebView.
+
+/** Flat stroke speaker icons — match the rest of the chrome. */
+function volumeIconSvg(vol: number, muted: boolean): string {
+  const off = muted || vol <= 0.001;
+  if (off) {
+    return `<svg class="vol-ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></svg>`;
+  }
+  if (vol < 0.35) {
+    return `<svg class="vol-ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/></svg>`;
+  }
+  if (vol < 0.7) {
+    return `<svg class="vol-ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 12a3.5 3.5 0 0 0-1.2-2.6"/></svg>`;
+  }
+  return `<svg class="vol-ico" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5.5 5.5 0 0 1 0 7"/><path d="M18.2 5.8a9 9 0 0 1 0 12.4"/></svg>`;
+}
+
+function paintMuteButton() {
+  const btn = document.querySelector("#btn-mute");
+  if (!btn) return;
+  btn.innerHTML = volumeIconSvg(state.volume, state.muted);
+  btn.setAttribute("title", state.muted || state.volume <= 0.001 ? "取消静音" : "静音");
+}
+
+function applyVolume(next: number, opts?: { persist?: boolean; fromMute?: boolean }) {
+  const v = Math.min(1, Math.max(0, next));
+  state.volume = v;
+  if (!opts?.fromMute) {
+    state.muted = v <= 0.001;
+    if (v > 0.001) state.volumeBeforeMute = v;
+  }
+  audio.volume = state.muted ? 0 : v;
+  if (opts?.persist !== false && !state.muted) persistVolume(v);
+  const slider = document.querySelector<HTMLInputElement>("#volume");
+  if (slider && document.activeElement !== slider) slider.value = String(v);
+  paintMuteButton();
+}
+
+function toggleMute() {
+  if (state.muted || state.volume <= 0.001) {
+    const restore = state.volumeBeforeMute > 0.001 ? state.volumeBeforeMute : 0.85;
+    state.muted = false;
+    applyVolume(restore);
+  } else {
+    state.volumeBeforeMute = state.volume > 0.001 ? state.volume : state.volumeBeforeMute;
+    state.muted = true;
+    audio.volume = 0;
+    paintMuteButton();
+  }
+}
+
+/** How many track rows fit in the main scroll area. */
+function calcListPageSize(): number {
+  const scroll = document.querySelector(".page-scroll") as HTMLElement | null;
+  const h = scroll?.clientHeight || Math.max(320, window.innerHeight - 220);
+  const reserved = 118; // title + section head + pager
+  const rowH = 58;
+  return Math.max(5, Math.min(12, Math.floor((h - reserved) / rowH)));
+}
+
+/** @deprecated alias — search uses the same viewport sizing */
+function calcSearchPageSize(): number {
+  return calcListPageSize();
+}
+
+/** Per-source API limit so interleaved results ≈ one screen. */
+function searchLimitPerSource(pageSize: number): number {
+  const sources = Math.max(1, state.settings.enabledSources?.length || 1);
+  return Math.max(2, Math.min(10, Math.ceil(pageSize / sources)));
+}
+
+function totalPagesFor(count: number, pageSize: number): number {
+  return Math.max(1, Math.ceil(Math.max(0, count) / Math.max(1, pageSize)));
+}
+
+function clampPage(page: number, count: number, pageSize: number): number {
+  return Math.min(Math.max(1, page), totalPagesFor(count, pageSize));
+}
+
+function slicePage<T>(items: T[], page: number, pageSize: number) {
+  const total = items.length;
+  const totalPages = totalPagesFor(total, pageSize);
+  const safePage = clampPage(page, total, pageSize);
+  const start = (safePage - 1) * pageSize;
+  return {
+    items: items.slice(start, start + pageSize),
+    page: safePage,
+    totalPages,
+    total,
+    startIndex: start,
+  };
+}
+
+function renderPager(opts: {
+  key: string;
+  page: number;
+  totalPages: number;
+  ariaLabel: string;
+}): string {
+  if (opts.totalPages <= 1) return "";
+  return `
+    <div class="pager" role="navigation" aria-label="${escapeAttr(opts.ariaLabel)}" data-pager="${escapeAttr(opts.key)}">
+      <button class="btn ghost sm" type="button" data-page-delta="-1" ${opts.page <= 1 ? "disabled" : ""}>上一页</button>
+      <span class="pager-indicator">第 ${opts.page} / ${opts.totalPages} 页</span>
+      <button class="btn ghost sm" type="button" data-page-delta="1" ${
+        opts.page >= opts.totalPages ? "disabled" : ""
+      }>下一页</button>
+    </div>
+  `;
+}
+
+function browsingPlaylist(): RecommendPlaylist | null {
+  const id = state.browsePlaylistId;
+  if (!id) return null;
+  return state.recommend?.hotPlaylists.find((p) => p.id === id) ?? null;
+}
+
+function clearBrowse() {
+  state.browsePlaylistId = null;
+  state.browsePage = 1;
+}
+
+function openRecommendPlaylist(pl: RecommendPlaylist) {
+  clearSearchResults();
+  state.browsePlaylistId = pl.id;
+  state.browsePage = 1;
+  state.tab = "discover";
+  if (pl.tracks.length) {
+    void playTrack(pl.tracks[0], pl.tracks);
+  }
+  render();
+}
+
+function clearSearchResults() {
+  state.searchTracks = [];
+  state.page = 1;
+  state.searchHasMore = false;
+}
+
+function goLocalListPage(key: string, delta: number) {
+  const pageSize = calcListPageSize();
+  if (key === "hot") {
+    const total = state.recommend?.hotTracks.length ?? 0;
+    state.hotPage = clampPage(state.hotPage + delta, total, pageSize);
+  } else if (key === "fav") {
+    const total = state.library?.favorites.length ?? 0;
+    state.favPage = clampPage(state.favPage + delta, total, pageSize);
+  } else if (key === "browse") {
+    const pl = browsingPlaylist();
+    const total = pl?.tracks.length ?? 0;
+    state.browsePage = clampPage(state.browsePage + delta, total, pageSize);
+  } else {
+    return;
+  }
+  renderMain();
+}
+
+function syncLocalPagesToSize() {
+  const pageSize = calcListPageSize();
+  state.hotPage = clampPage(state.hotPage, state.recommend?.hotTracks.length ?? 0, pageSize);
+  state.favPage = clampPage(state.favPage, state.library?.favorites.length ?? 0, pageSize);
+  const pl = browsingPlaylist();
+  state.browsePage = clampPage(state.browsePage, pl?.tracks.length ?? 0, pageSize);
+}
 
 /** Prefer https for remote media (Kuwo often returns http://). */
 function preferHttps(url: string): string {
@@ -249,6 +444,23 @@ async function boot() {
   void refreshRecommend(false);
   void listenRecommendUpdates();
   void listenDesktopLyricsReady();
+
+  let resizeTimer = 0;
+  let lastListPageSize = calcListPageSize();
+  window.addEventListener("resize", () => {
+    window.clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(() => {
+      const next = calcListPageSize();
+      if (next === lastListPageSize) return;
+      lastListPageSize = next;
+      syncLocalPagesToSize();
+      if (state.searchTracks.length && state.keyword.trim() && !state.searching && !state.browsePlaylistId) {
+        void fetchSearchPage(state.page, false);
+      } else if (state.browsePlaylistId || state.tab === "library" || state.tab === "discover") {
+        renderMain();
+      }
+    }, 280);
+  });
 }
 
 async function listenDesktopLyricsReady() {
@@ -382,6 +594,8 @@ async function refreshRecommend(fromUser = true) {
     ignoreRecommendEventsUntil = Date.now() + 4000;
     // Full refresh: wipe old cards/list so the reload is obvious.
     state.recommend = { hotTracks: [], hotPlaylists: [] };
+    state.hotPage = 1;
+    clearBrowse();
     renderMain();
   }
   try {
@@ -389,6 +603,10 @@ async function refreshRecommend(fromUser = true) {
       ? await invoke<RecommendCatalog>("refresh_recommend")
       : await invoke<RecommendCatalog>("load_recommend");
     state.recommend = catalog;
+    state.hotPage = clampPage(state.hotPage, catalog.hotTracks.length, calcListPageSize());
+    if (state.browsePlaylistId && !catalog.hotPlaylists.some((p) => p.id === state.browsePlaylistId)) {
+      clearBrowse();
+    }
     const empty = !catalog.hotTracks?.length && !catalog.hotPlaylists?.length;
     if (fromUser) {
       state.recommendReveal = !empty;
@@ -428,29 +646,16 @@ async function doSearch(reset = true) {
   }
   pushSearchHistory(keyword);
   state.searchHistoryOpen = false;
+  clearBrowse();
   if (reset) state.page = 1;
   state.tab = "discover";
-  state.searching = true;
-  renderMain();
-  try {
-    state.searchTracks = await invoke<Track[]>("search_tracks", {
-      keyword,
-      page: state.page,
-      reset,
-    });
-    if (!state.searchTracks.length) toast("没有找到结果");
-  } catch (e) {
-    toast(String(e));
-  } finally {
-    state.searching = false;
-    renderMain();
-  }
+  await fetchSearchPage(state.page, true);
 }
 
 function clearSearch() {
-  state.searchTracks = [];
+  clearSearchResults();
+  clearBrowse();
   state.keyword = "";
-  state.page = 1;
   state.tab = "discover";
   renderMain();
 }
@@ -460,23 +665,61 @@ function toggleLyrics(force?: boolean) {
   render();
 }
 
-async function loadMore() {
-  state.page += 1;
+async function fetchSearchPage(page: number, isNewSearch: boolean) {
+  const keyword = state.keyword.trim();
+  if (!keyword || page < 1 || state.searching) return;
+
+  const prevPage = state.page;
+  const prevTracks = state.searchTracks;
+  const prevHasMore = state.searchHasMore;
+  const pageSize = calcSearchPageSize();
+  const limitPerSource = searchLimitPerSource(pageSize);
+  state.page = page;
   state.searching = true;
   renderMain();
   try {
-    state.searchTracks = await invoke<Track[]>("search_tracks", {
-      keyword: state.keyword,
-      page: state.page,
-      reset: false,
+    // reset:true so each page is independent (not append/accumulate).
+    const tracks = await invoke<Track[]>("search_tracks", {
+      keyword,
+      page,
+      reset: true,
+      limitPerSource,
     });
+    if (!tracks.length) {
+      if (page > 1) {
+        toast("没有更多了");
+        state.page = prevPage;
+        state.searchTracks = prevTracks;
+        state.searchHasMore = false;
+      } else {
+        state.searchTracks = [];
+        state.searchHasMore = false;
+        if (isNewSearch) toast("没有找到结果");
+      }
+      return;
+    }
+    // Keep one screen of rows even if sources return a bit more.
+    state.searchTracks = tracks.slice(0, pageSize);
+    state.searchHasMore = tracks.length >= pageSize;
   } catch (e) {
     toast(String(e));
-    state.page = Math.max(1, state.page - 1);
+    state.page = prevPage;
+    state.searchTracks = prevTracks;
+    state.searchHasMore = prevHasMore;
   } finally {
     state.searching = false;
     renderMain();
   }
+}
+
+async function goSearchPage(delta: number) {
+  const next = state.page + delta;
+  if (next < 1) return;
+  if (delta > 0 && !state.searchHasMore) {
+    toast("没有更多了");
+    return;
+  }
+  await fetchSearchPage(next, false);
 }
 
 async function playTrack(track: Track, queue?: Track[]) {
@@ -506,6 +749,8 @@ async function playTrack(track: Track, queue?: Track[]) {
     }
     state.current = detailed;
     state.lyrics = parseLrc(detailed.lrc);
+    lastLyricScrollIdx = -1;
+    lyricsUserScrollUntil = 0;
     lastDesktopLyricLine = "";
     audio.src = toPlayableSrc(preferHttps(detailed.audioUrl));
     await audio.play();
@@ -582,6 +827,11 @@ async function toggleFavorite(track: Track) {
   try {
     const added = await invoke<boolean>("toggle_favorite", { track });
     state.library = await invoke<LibrarySnapshot>("get_library");
+    state.favPage = clampPage(
+      state.favPage,
+      state.library?.favorites.length ?? 0,
+      calcListPageSize(),
+    );
     toast(added ? "已收藏" : "已取消收藏");
     render();
   } catch (e) {
@@ -715,8 +965,14 @@ async function downloadTrack(track: Track) {
   state.downloadingUid = track.uid;
   render();
   try {
-    const path = await invoke<string>("download_track", { track });
-    toast(`已下载：${path}`);
+    const result = await invoke<{ path: string; alreadyExists: boolean }>("download_track", {
+      track,
+    });
+    toast(
+      result.alreadyExists
+        ? `已存在，无需重复下载：${result.path}`
+        : `已下载：${result.path}`,
+    );
   } catch (e) {
     toast(`下载失败：${String(e)}`);
   } finally {
@@ -784,8 +1040,15 @@ function openTrackContextMenu(e: MouseEvent, trackUid: string, queueKey: string)
 
 function queueFromKey(key: string): Track[] {
   if (key === "search") return state.searchTracks;
-  if (key === "hot") return state.recommend?.hotTracks.slice(0, 16) ?? [];
+  if (key === "hot") return state.recommend?.hotTracks ?? [];
   if (key === "fav") return (state.library?.favorites ?? []).map(storedToTrack);
+  if (key === "browse") {
+    return browsingPlaylist()?.tracks.slice() ?? [];
+  }
+  if (key.startsWith("rec-")) {
+    const id = key.slice(4);
+    return state.recommend?.hotPlaylists.find((p) => p.id === id)?.tracks.slice() ?? [];
+  }
   if (key.startsWith("pl-")) {
     const id = key.slice(3);
     const pl = state.library?.playlists.find((p) => p.id === id);
@@ -1012,37 +1275,68 @@ function trackRow(track: Track, index: number) {
   `;
 }
 
-function trackList(tracks: Track[], queueKey: string): string {
+function trackList(tracks: Track[], queueKey: string, startIndex = 0): string {
   if (!tracks.length) return `<div class="empty">暂无歌曲</div>`;
   return `
     <div class="track-list" data-queue="${escapeAttr(queueKey)}">
       <div class="track-list-head">
         <span>#</span><span></span><span>歌曲</span><span class="col-artist">歌手</span><span>来源</span><span></span>
       </div>
-      ${tracks.map((t, i) => trackRow(t, i)).join("")}
+      ${tracks.map((t, i) => trackRow(t, startIndex + i)).join("")}
     </div>
   `;
 }
 
 function renderDiscover(): string {
-  const hot = state.recommend?.hotTracks?.slice(0, 20) ?? [];
   const playlists = state.recommend?.hotPlaylists ?? [];
-  const hasSearch = state.searchTracks.length > 0;
+  const pageSize = calcListPageSize();
+  const browsing = browsingPlaylist();
+  const hasSearch = state.searchTracks.length > 0 && !browsing;
 
-  if (hasSearch) {
+  if (browsing) {
+    const sliced = slicePage(browsing.tracks, state.browsePage, pageSize);
+    state.browsePage = sliced.page;
     return `
-      <h1 class="page-title">搜索结果<span class="sub">共 ${state.searchTracks.length} 首 · 「${escapeHtml(state.keyword)}」</span></h1>
-      ${state.searching ? `<div class="status">搜索中…</div>` : ""}
+      <h1 class="page-title">${escapeHtml(browsing.name)}<span class="sub">${escapeHtml(browsing.subtitle)} · 共 ${sliced.total} 首 · 第 ${sliced.page} 页</span></h1>
       <div class="section">
         <div class="section-head">
           <h2>歌曲</h2>
-          <button class="btn ghost sm" id="btn-load-more" ${state.searching ? "disabled" : ""}>加载更多</button>
+          ${renderPager({
+            key: "browse",
+            page: sliced.page,
+            totalPages: sliced.totalPages,
+            ariaLabel: "歌单分页",
+          })}
+        </div>
+        ${trackList(sliced.items, `rec-${browsing.id}`, sliced.startIndex)}
+      </div>
+    `;
+  }
+
+  if (hasSearch) {
+    return `
+      <h1 class="page-title">搜索结果<span class="sub">第 ${state.page} 页 · 本页 ${state.searchTracks.length} 首 · 「${escapeHtml(state.keyword)}」</span></h1>
+      <div class="section">
+        <div class="section-head">
+          <h2>歌曲</h2>
+          <div class="pager" role="navigation" aria-label="搜索分页">
+            <button class="btn ghost sm" id="btn-search-prev" type="button" ${
+              state.searching || state.page <= 1 ? "disabled" : ""
+            }>上一页</button>
+            <span class="pager-indicator">第 ${state.page} 页</span>
+            <button class="btn ghost sm" id="btn-search-next" type="button" ${
+              state.searching || !state.searchHasMore ? "disabled" : ""
+            }>下一页</button>
+          </div>
         </div>
         ${trackList(state.searchTracks, "search")}
       </div>
     `;
   }
 
+  const hotAll = state.recommend?.hotTracks ?? [];
+  const hot = slicePage(hotAll, state.hotPage, pageSize);
+  state.hotPage = hot.page;
   const refreshing = state.recommendLoading;
   const reveal = state.recommendReveal && !refreshing;
   return `
@@ -1080,9 +1374,18 @@ function renderDiscover(): string {
     <section class="section ${refreshing ? "is-refreshing" : reveal ? "rec-enter" : ""}">
       <div class="section-head">
         <h2>热门歌曲</h2>
-        <span class="hint">${refreshing ? "正在拉取最新推荐…" : "点击即播"}</span>
+        ${
+          refreshing
+            ? `<span class="hint">正在拉取最新推荐…</span>`
+            : renderPager({
+                key: "hot",
+                page: hot.page,
+                totalPages: hot.totalPages,
+                ariaLabel: "热门歌曲分页",
+              }) || `<span class="hint">点击即播 · 共 ${hot.total} 首</span>`
+        }
       </div>
-      ${refreshing ? trackSkeleton(8) : trackList(hot, "hot")}
+      ${refreshing ? trackSkeleton(8) : trackList(hot.items, "hot", hot.startIndex)}
     </section>
   `;
 }
@@ -1118,7 +1421,9 @@ function trackSkeleton(count: number): string {
 }
 
 function renderLibrary(): string {
-  const favs = (state.library?.favorites ?? []).map(storedToTrack);
+  const favsAll = (state.library?.favorites ?? []).map(storedToTrack);
+  const favs = slicePage(favsAll, state.favPage, calcListPageSize());
+  state.favPage = favs.page;
   const playlists = state.library?.playlists ?? [];
   const pane = state.libraryPane;
   const favActive = pane === "favorites";
@@ -1127,7 +1432,7 @@ function renderLibrary(): string {
     <div class="library-stack">
       <div class="lib-tabs" role="tablist">
         <button type="button" class="lib-tab ${favActive ? "active" : ""}" data-lib-pane="favorites" role="tab" aria-selected="${favActive}">
-          我喜欢 · ${favs.length}
+          我喜欢 · ${favsAll.length}
         </button>
         <button type="button" class="lib-tab ${!favActive ? "active" : ""}" data-lib-pane="playlists" role="tab" aria-selected="${!favActive}">
           自建歌单 · ${playlists.length}
@@ -1137,8 +1442,19 @@ function renderLibrary(): string {
         favActive
           ? `<section class="lib-pane">
               ${
-                favs.length
-                  ? trackList(favs, "fav")
+                favsAll.length
+                  ? `<div class="section-head compact">
+                      <h2>我喜欢</h2>
+                      ${
+                        renderPager({
+                          key: "fav",
+                          page: favs.page,
+                          totalPages: favs.totalPages,
+                          ariaLabel: "我喜欢分页",
+                        }) || `<span class="hint">共 ${favs.total} 首</span>`
+                      }
+                    </div>
+                    ${trackList(favs.items, "fav", favs.startIndex)}`
                   : `<div class="empty empty-sm">还没有收藏，去发现页点 ♡ 吧</div>`
               }
             </section>`
@@ -1286,7 +1602,7 @@ function renderTopbarHtml(): string {
   return `
     <div class="topbar">
       ${
-        state.searchTracks.length
+        state.searchTracks.length || state.browsePlaylistId
           ? `<button class="back-btn" id="btn-clear-search" type="button" title="返回发现" aria-label="返回发现">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M15 18l-6-6 6-6"/>
@@ -1317,7 +1633,9 @@ function renderTopbarHtml(): string {
               : ""
           }
         </div>
-        <button class="btn sm" id="btn-search" ${state.searching ? "disabled" : ""}>搜索</button>
+        <button class="btn sm" id="btn-search" ${state.searching ? "disabled" : ""}>${
+          state.searching ? "搜索中…" : "搜索"
+        }</button>
       </div>
     </div>`;
 }
@@ -1403,6 +1721,21 @@ function render() {
           </div>
         </div>
         <div class="player-extra">
+          <div class="volume-row" title="音量">
+            <button class="icon-btn volume-mute" id="btn-mute" type="button" title="${
+              state.muted || state.volume <= 0.001 ? "取消静音" : "静音"
+            }">${volumeIconSvg(state.volume, state.muted)}</button>
+            <input
+              class="volume"
+              id="volume"
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value="${state.muted ? 0 : state.volume}"
+              aria-label="音量"
+            />
+          </div>
           <button class="mode-btn" id="btn-mode-bar" type="button">${modeLabel()}</button>
           <button class="mode-btn" id="toggle-lyrics-2" type="button">${showLyrics ? "收起歌词" : "歌词"}</button>
           <button class="mode-btn" id="btn-desktop-lyrics" type="button">${state.desktopLyrics ? "关闭桌面歌词" : "桌面歌词"}</button>
@@ -1425,6 +1758,10 @@ function afterRenderMotion() {
     lastMotionTab = state.tab;
     lastMotionTrackUid = state.current?.uid || "";
     lastMotionLyricsOpen = state.lyricsOpen;
+    if (state.lyricsOpen && state.lyrics.length) {
+      lastLyricScrollIdx = -1;
+      requestAnimationFrame(() => syncLyricsHighlight({ forceScroll: true }));
+    }
     return;
   }
 
@@ -1439,6 +1776,12 @@ function afterRenderMotion() {
     page?.classList.remove("page-enter");
     void (page as HTMLElement | null)?.offsetWidth;
     page?.classList.add("page-enter");
+    const tabBtn = document.querySelector<HTMLElement>(`.nav button.active`);
+    if (tabBtn) {
+      tabBtn.classList.remove("soft-pop");
+      void tabBtn.offsetWidth;
+      tabBtn.classList.add("soft-pop");
+    }
   }
 
   if (trackChanged) {
@@ -1460,6 +1803,12 @@ function afterRenderMotion() {
     pp?.classList.remove("pp-pop");
     void (pp as HTMLElement | null)?.offsetWidth;
     pp?.classList.add("pp-pop");
+    const row = document.querySelector<HTMLElement>(".track-row.active");
+    if (row) {
+      row.classList.remove("soft-pop");
+      void row.offsetWidth;
+      row.classList.add("soft-pop");
+    }
   }
 
   // Lyrics panel already gets CSS animation via .lyrics-open; re-trigger if needed.
@@ -1475,6 +1824,12 @@ function afterRenderMotion() {
   lastMotionTab = state.tab;
   lastMotionTrackUid = state.current?.uid || "";
   lastMotionLyricsOpen = state.lyricsOpen;
+
+  // Full DOM rebuild resets scrollTop — snap back to the singing line.
+  if (state.lyricsOpen && state.lyrics.length) {
+    if (trackChanged || lyricsJustOpened) lastLyricScrollIdx = -1;
+    requestAnimationFrame(() => syncLyricsHighlight({ forceScroll: true }));
+  }
 }
 
 function queueFor(el: Element | null): Track[] {
@@ -1528,6 +1883,19 @@ function bindChromeEvents() {
   seek?.addEventListener("input", () => {
     audio.currentTime = Number(seek.value);
     state.position = audio.currentTime;
+    lyricsUserScrollUntil = 0;
+    lastLyricScrollIdx = -1;
+    syncLyricsHighlight({ forceScroll: true });
+  });
+
+  document.querySelector("#btn-mute")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleMute();
+  });
+  const volume = document.querySelector<HTMLInputElement>("#volume");
+  volume?.addEventListener("input", () => {
+    state.muted = false;
+    applyVolume(Number(volume.value));
   });
 }
 
@@ -1595,7 +1963,18 @@ function bindMainEvents() {
   });
   document.querySelector("#btn-search")?.addEventListener("click", () => void doSearch(true));
   document.querySelector("#btn-clear-search")?.addEventListener("click", () => clearSearch());
-  document.querySelector("#btn-load-more")?.addEventListener("click", () => void loadMore());
+  document.querySelector("#btn-search-prev")?.addEventListener("click", () => void goSearchPage(-1));
+  document.querySelector("#btn-search-next")?.addEventListener("click", () => void goSearchPage(1));
+  document.querySelectorAll<HTMLElement>("[data-pager]").forEach((pager) => {
+    const key = pager.dataset.pager || "";
+    pager.querySelectorAll<HTMLButtonElement>("[data-page-delta]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const delta = Number(btn.dataset.pageDelta || 0);
+        if (!delta || !key) return;
+        goLocalListPage(key, delta);
+      });
+    });
+  });
   document.querySelector("#btn-refresh-rec")?.addEventListener("click", () => void refreshRecommend(true));
 
   document.querySelectorAll<HTMLElement>("[data-play-uid]").forEach((row) => {
@@ -1641,13 +2020,7 @@ function bindMainEvents() {
   document.querySelectorAll<HTMLElement>("[data-playlist-id]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const pl = state.recommend?.hotPlaylists.find((p) => p.id === btn.dataset.playlistId);
-      if (pl?.tracks?.length) {
-        state.searchTracks = pl.tracks;
-        state.keyword = pl.name;
-        state.tab = "discover";
-        void playTrack(pl.tracks[0], pl.tracks);
-        render();
-      }
+      if (pl?.tracks?.length) openRecommendPlaylist(pl);
     });
   });
 
@@ -1775,6 +2148,73 @@ function bindOverlayEvents() {
   }
 }
 
+/** Last lyric index we scrolled to — avoid smooth-scroll spam on every timeupdate. */
+let lastLyricScrollIdx = -1;
+/** Ignore auto-scroll briefly after the user manually scrolls the lyrics pane. */
+let lyricsUserScrollUntil = 0;
+
+function activeLyricIndex(position: number): number {
+  if (!state.lyrics.length) return -1;
+  for (let i = 0; i < state.lyrics.length; i++) {
+    const next = state.lyrics[i + 1];
+    if (position >= state.lyrics[i].time && (!next || position < next.time)) return i;
+  }
+  if (position < state.lyrics[0].time) return -1;
+  return state.lyrics.length - 1;
+}
+
+function bindLyricsScrollGuard(container: Element) {
+  if ((container as HTMLElement).dataset.scrollGuard === "1") return;
+  (container as HTMLElement).dataset.scrollGuard = "1";
+  container.addEventListener(
+    "wheel",
+    () => {
+      lyricsUserScrollUntil = Date.now() + 4000;
+    },
+    { passive: true },
+  );
+  container.addEventListener(
+    "touchmove",
+    () => {
+      lyricsUserScrollUntil = Date.now() + 4000;
+    },
+    { passive: true },
+  );
+}
+
+function syncLyricsHighlight(opts?: { forceScroll?: boolean }) {
+  const lyrics = document.querySelector(".lyrics");
+  if (!lyrics || !state.lyrics.length) return;
+  bindLyricsScrollGuard(lyrics);
+
+  const lines = lyrics.querySelectorAll(":scope > div");
+  const activeIdx = activeLyricIndex(state.position);
+  state.lyrics.forEach((_, idx) => {
+    lines[idx]?.classList.toggle("active-line", idx === activeIdx);
+  });
+
+  if (activeIdx < 0) return;
+  const force = opts?.forceScroll === true;
+  const userScrolling = Date.now() < lyricsUserScrollUntil;
+  if (!force && userScrolling) return;
+  if (!force && activeIdx === lastLyricScrollIdx) return;
+
+  lastLyricScrollIdx = activeIdx;
+  const el = lines[activeIdx] as HTMLElement | undefined;
+  if (!el) return;
+  // Scroll only `.lyrics` (not ancestors) so the player dock stays put.
+  // Use viewport math — offsetTop is unreliable when offsetParent isn't `.lyrics`.
+  const box = lyrics as HTMLElement;
+  const elRect = el.getBoundingClientRect();
+  const boxRect = box.getBoundingClientRect();
+  const delta =
+    elRect.top + elRect.height / 2 - (boxRect.top + boxRect.height / 2);
+  box.scrollTo({
+    top: Math.max(0, box.scrollTop + delta),
+    behavior: force ? "auto" : "smooth",
+  });
+}
+
 function patchPlayerChrome() {
   const cur = document.querySelector("#time-cur");
   const dur = document.querySelector("#time-dur");
@@ -1785,15 +2225,7 @@ function patchPlayerChrome() {
     seek.max = String(Math.max(1, state.duration));
     seek.value = String(state.position);
   }
-  const lyrics = document.querySelector(".lyrics");
-  if (lyrics) {
-    const lines = lyrics.querySelectorAll("div");
-    state.lyrics.forEach((line, idx) => {
-      const next = state.lyrics[idx + 1];
-      const active = state.position >= line.time && (!next || state.position < next.time);
-      lines[idx]?.classList.toggle("active-line", active);
-    });
-  }
+  syncLyricsHighlight();
 }
 
 audio.addEventListener("timeupdate", () => {
