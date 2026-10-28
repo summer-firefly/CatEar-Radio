@@ -2,7 +2,7 @@
 
 多音源音乐搜索与播放客户端。
 
-技术栈：**Rust（Tauri 2）后端 + 系统 WebView 前端（Vite + TypeScript）**。参考 [BlueMusic](../BlueMusic) 的产品结构与音源抽象。
+技术栈：**Rust（Tauri 2）后端 + 系统 WebView 前端（Vite + TypeScript）**。
 
 ## 支持平台
 
@@ -16,12 +16,13 @@
 
 ## 功能
 
-- 多音源搜索：网易云 / QQ / 酷我（交错合并，支持加载更多）
-- 发现页：热门歌曲与榜单歌单
-- 正在播放：进度、歌词、播放模式（列表循环 / 单曲循环 / 随机）
-- 我的：收藏、自建歌单、JSON 导入导出
-- 设置：启用音源、每源结果数
-- 本地播放：WebView HTML5 Audio（由 Rust 解析播放地址）
+- 多音源搜索：网易云 / QQ / 酷我（交错合并，按页翻看）
+- 发现页：热门歌曲、榜单歌单；列表按窗口高度分页
+- 我的：收藏（分页）、自建歌单、加入歌单
+- 播放：进度、音量、播放模式（列表循环 / 单曲循环 / 随机）
+- 歌词：侧栏歌词（当前句居中高亮）、桌面歌词（桌面端）
+- 下载：歌曲本地下载；设置中可改下载目录
+- 设置：启用音源、每源结果数、音源 JSON 导入
 
 ## 环境
 
@@ -45,8 +46,10 @@ npm run tauri dev
 npm run tauri build
 
 # Android
-npm run tauri -- android build --apk --ci --target aarch64
+npm run tauri -- android build --apk --ci
 ```
+
+产物说明见 [`releases/README.md`](releases/README.md)。
 
 ## 工程结构
 
@@ -62,6 +65,7 @@ npm run tauri -- android build --apk --ci --target aarch64
 │       ├── repo/        # 搜索合并、推荐
 │       ├── library.rs   # 收藏与歌单持久化
 │       └── settings.rs
+├── releases/            # 本地构建产物（不入库）
 ├── package.json
 └── README.md
 ```
