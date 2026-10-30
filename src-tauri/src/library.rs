@@ -29,13 +29,10 @@ impl LibraryStore {
     }
 
     fn persist(&self, data: &LibrarySnapshot) {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         let mut out = data.clone();
         out.saved_at = Utc::now().to_rfc3339();
         if let Ok(json) = serde_json::to_string_pretty(&out) {
-            let _ = fs::write(&self.path, json);
+            let _ = crate::storage::write_atomic(&self.path, json.as_bytes());
         }
     }
 

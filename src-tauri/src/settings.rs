@@ -31,11 +31,8 @@ impl SettingsStore {
     }
 
     pub fn save(&self, settings: AppSettings) -> AppSettings {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
-            let _ = fs::write(&self.path, json);
+            let _ = crate::storage::write_atomic(&self.path, json.as_bytes());
         }
         *self.settings.lock() = settings.clone();
         settings

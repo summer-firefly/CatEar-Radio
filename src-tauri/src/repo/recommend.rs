@@ -128,11 +128,8 @@ impl RecommendRepository {
                 }
                 guard.catalog = catalog.clone();
                 guard.updated_at_ms = Some(now_ms());
-                if let Some(parent) = self.path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
                 if let Ok(json) = serde_json::to_string(&catalog) {
-                    let _ = fs::write(&self.path, json);
+                    let _ = crate::storage::write_atomic(&self.path, json.as_bytes());
                 }
                 drop(guard);
                 if emit_event {

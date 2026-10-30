@@ -6,6 +6,7 @@ mod repo;
 mod settings;
 mod source;
 mod state;
+mod storage;
 
 use std::sync::Arc;
 
