@@ -63,6 +63,7 @@ const RECENT_KEY = "maoer-recent";
 const RECENT_MAX = 50;
 const LYRIC_FONT_KEY = "maoer-lyric-font";
 const LYRIC_OFFSET_KEY = "maoer-lyric-offset";
+const LYRIC_OFFSET_MAP_KEY = "maoer-lyric-offset-map";
 type LyricFontSize = "sm" | "md" | "lg";
 
 function loadLyricFont(): LyricFontSize {
@@ -78,11 +79,36 @@ function loadLyricFont(): LyricFontSize {
 function loadLyricOffset(): number {
   try {
     const v = Number(localStorage.getItem(LYRIC_OFFSET_KEY));
-    if (Number.isFinite(v)) return Math.max(-10, Math.min(10, Math.round(v * 2) / 2));
+    if (Number.isFinite(v)) return clampLyricOffset(v);
   } catch {
     /* ignore */
   }
   return 0;
+}
+
+function clampLyricOffset(v: number): number {
+  return Math.max(-10, Math.min(10, Math.round(v * 2) / 2));
+}
+
+/** Per-track lyric offsets; falls back to the global default when absent. */
+function loadLyricOffsetMap(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(LYRIC_OFFSET_MAP_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: Record<string, number> = {};
+    for (const [uid, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[uid] = clampLyricOffset(v);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function lyricOffsetFor(uid: string | undefined): number {
+  if (uid && uid in state.lyricOffsetMap) return state.lyricOffsetMap[uid];
+  return state.lyricOffsetDefault;
 }
 
 function loadVolume(): number {
@@ -273,7 +299,10 @@ const state = {
   lyrics: [] as LyricLine[],
   lyricsOpen: false,
   lyricFont: loadLyricFont() as LyricFontSize,
-  lyricOffset: loadLyricOffset(),
+  /** Fallback offset used when the current track has no per-track override. */
+  lyricOffsetDefault: loadLyricOffset(),
+  /** Per-track lyric offsets keyed by track uid. */
+  lyricOffsetMap: loadLyricOffsetMap(),
   toast: "",
   page: 1,
   /** Whether a newer search page likely exists (based on last page size). */
@@ -405,11 +434,54 @@ function applyVolume(next: number, opts?: { persist?: boolean; fromMute?: boolea
     state.muted = v <= 0.001;
     if (v > 0.001) state.volumeBeforeMute = v;
   }
+  // Cancel any running fade so the slider wins immediately.
+  fadeToken += 1;
   audio.volume = state.muted ? 0 : v;
   if (opts?.persist !== false && !state.muted) persistVolume(v);
   const slider = document.querySelector<HTMLInputElement>("#volume");
   if (slider && document.activeElement !== slider) slider.value = String(v);
   paintMuteButton();
+}
+
+/** Effective volume when not fading — muted tracks ramp to 0. */
+function baseVolume(): number {
+  return state.muted ? 0 : state.volume;
+}
+
+/** Bumped on every ramp / manual volume change so stale ramps stop writing. */
+let fadeToken = 0;
+
+/** Short linear volume ramp. Only touches `audio.volume`, never `state.volume`. */
+function rampVolume(target: number, ms: number): Promise<void> {
+  const token = ++fadeToken;
+  const from = audio.volume;
+  const to = Math.min(1, Math.max(0, target));
+  if (Math.abs(to - from) < 0.001) {
+    audio.volume = to;
+    return Promise.resolve();
+  }
+  const startedAt = performance.now();
+  return new Promise((resolve) => {
+    const step = (now: number) => {
+      if (token !== fadeToken) {
+        resolve();
+        return;
+      }
+      const p = Math.min(1, (now - startedAt) / ms);
+      audio.volume = from + (to - from) * p;
+      if (p < 1) requestAnimationFrame(step);
+      else resolve();
+    };
+    requestAnimationFrame(step);
+  });
+}
+
+/** Fade to silence, then pause — unless another ramp superseded us. */
+async function fadeOutAndPause() {
+  const token = fadeToken + 1;
+  await rampVolume(0, 180);
+  if (token !== fadeToken) return;
+  audio.pause();
 }
 
 function toggleMute() {
@@ -420,7 +492,7 @@ function toggleMute() {
   } else {
     state.volumeBeforeMute = state.volume > 0.001 ? state.volume : state.volumeBeforeMute;
     state.muted = true;
-    audio.volume = 0;
+    void rampVolume(0, 120);
     paintMuteButton();
   }
 }
@@ -602,7 +674,8 @@ function emptyState(icon: string, title: string, hint = ""): string {
 function persistLyricPrefs() {
   try {
     localStorage.setItem(LYRIC_FONT_KEY, state.lyricFont);
-    localStorage.setItem(LYRIC_OFFSET_KEY, String(state.lyricOffset));
+    localStorage.setItem(LYRIC_OFFSET_KEY, String(state.lyricOffsetDefault));
+    localStorage.setItem(LYRIC_OFFSET_MAP_KEY, JSON.stringify(state.lyricOffsetMap));
   } catch {
     /* ignore */
   }
@@ -620,12 +693,28 @@ function cycleLyricFont(delta: number) {
   else render();
 }
 
-function nudgeLyricOffset(delta: number) {
-  state.lyricOffset = Math.max(-10, Math.min(10, Math.round((state.lyricOffset + delta) * 2) / 2));
+/** Current track's offset — per-track override when present, otherwise the default. */
+function currentLyricOffset(): number {
+  return lyricOffsetFor(state.current?.uid);
+}
+
+function setLyricOffset(value: number) {
+  const v = clampLyricOffset(value);
+  const uid = state.current?.uid;
+  if (uid) {
+    if (v === state.lyricOffsetDefault) delete state.lyricOffsetMap[uid];
+    else state.lyricOffsetMap[uid] = v;
+  } else {
+    state.lyricOffsetDefault = v;
+  }
   persistLyricPrefs();
+}
+
+function nudgeLyricOffset(delta: number) {
+  setLyricOffset(currentLyricOffset() + delta);
   const label = document.querySelector("#lyric-offset-label");
   if (label) {
-    label.textContent = formatLyricOffset(state.lyricOffset);
+    label.textContent = formatLyricOffset(currentLyricOffset());
   } else {
     render();
   }
@@ -1172,11 +1261,15 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
 
   try {
     audio.pause();
+    // Start silent so the new track fades in instead of cutting in abruptly.
+    fadeToken += 1;
+    audio.volume = 0;
     const detailed = await invoke<Track>("ensure_playable", { track });
     if (gen !== playGeneration) return;
     if (!detailed.audioUrl) {
       toast("暂无可用播放地址");
       state.preparing = false;
+      audio.volume = baseVolume();
       render();
       return;
     }
@@ -1191,6 +1284,7 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
     pendingResume = null;
     await audio.play();
     if (gen !== playGeneration) return;
+    void rampVolume(baseVolume(), 220);
     state.playing = true;
     state.duration = audio.duration || 0;
     state.position = audio.currentTime || 0;
@@ -1201,6 +1295,7 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
     if (gen !== playGeneration || isAbortError(e)) return;
     toast(`播放失败：${String(e)}`);
     state.playing = false;
+    audio.volume = baseVolume();
     pushOsMediaTrack();
   } finally {
     if (gen === playGeneration) {
@@ -1214,19 +1309,22 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
 function playPause() {
   if (!state.current) return;
   if (state.playing) {
-    audio.pause();
+    void fadeOutAndPause();
     state.playing = false;
   } else if (!audio.getAttribute("src")) {
     // Restored session: audio has no source yet, load it and jump to the saved spot.
     pendingResume = state.position > 0 ? { uid: state.current.uid, seconds: state.position } : null;
     void playTrack(state.current, state.queue, state.queueKind);
   } else {
+    audio.volume = 0;
     void audio.play().then(
       () => {
         state.playing = true;
+        void rampVolume(baseVolume(), 180);
       },
       (e) => {
         if (!isAbortError(e)) toast(`播放失败：${String(e)}`);
+        audio.volume = baseVolume();
       },
     );
   }
@@ -2559,7 +2657,7 @@ function renderLyricsPanel(): string {
       <button class="btn ghost sm" type="button" id="btn-lyric-font-up" title="放大歌词">A+</button>
       <span class="lp-tools-sep" aria-hidden="true"></span>
       <button class="btn ghost sm" type="button" id="btn-lyric-offset-down" title="歌词提前 0.5 秒">−0.5</button>
-      <span class="lp-offset" id="lyric-offset-label" title="歌词时间偏移">${formatLyricOffset(state.lyricOffset)}</span>
+      <span class="lp-offset" id="lyric-offset-label" title="本曲歌词时间偏移">${formatLyricOffset(currentLyricOffset())}</span>
       <button class="btn ghost sm" type="button" id="btn-lyric-offset-up" title="歌词延后 0.5 秒">+0.5</button>
     </div>
     <div class="lyrics" data-size="${state.lyricFont}">${lyricHtml}</div>
@@ -3293,7 +3391,7 @@ let lyricsUserScrollUntil = 0;
 function activeLyricIndex(position: number): number {
   if (!state.lyrics.length) return -1;
   // Positive offset = lyrics feel late → compare against an earlier clock.
-  const t = position - state.lyricOffset;
+  const t = position - currentLyricOffset();
   for (let i = 0; i < state.lyrics.length; i++) {
     const next = state.lyrics[i + 1];
     if (t >= state.lyrics[i].time && (!next || t < next.time)) return i;
