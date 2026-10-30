@@ -14,6 +14,16 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Release signing lives outside the repo: the keystore and its passwords sit in
+// src-tauri/android-signing/, which .gitignore already excludes. Paths are
+// resolved from this module directory (src-tauri/gen/android/app).
+val keystoreProperties = Properties().apply {
+    val propFile = file("../../../android-signing/keystore.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     compileSdk = 37
     namespace = "com.maoer.radio"
@@ -24,6 +34,16 @@ android {
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    signingConfigs {
+        if (keystoreProperties.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = file("../../../android-signing/${keystoreProperties.getProperty("storeFile")}")
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -42,6 +62,7 @@ android {
             optimization {
                enable = true
             }
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(
                 *fileTree(".") {
                   include("**/*.pro")
