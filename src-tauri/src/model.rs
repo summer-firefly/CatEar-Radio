@@ -224,6 +224,40 @@ fn default_version() -> i32 {
     1
 }
 
+/// Preferred streaming quality, applied when resolving a playable URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioQuality {
+    Standard,
+    Hq,
+    Lossless,
+}
+
+impl AudioQuality {
+    pub fn from_id(id: &str) -> Self {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "standard" | "std" => Self::Standard,
+            "lossless" | "flac" => Self::Lossless,
+            _ => Self::Hq,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Hq => "hq",
+            Self::Lossless => "lossless",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "STD",
+            Self::Hq => "HQ",
+            Self::Lossless => "LOSSLESS",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -238,10 +272,17 @@ pub struct AppSettings {
     /// Directory containing `*.json` source manifests. Empty → `{app_data}/sources`
     #[serde(default)]
     pub sources_dir: String,
+    /// Streaming quality: `standard` / `hq` / `lossless`.
+    #[serde(default = "default_quality")]
+    pub quality: String,
 }
 
 fn default_limit() -> u32 {
     10
+}
+
+fn default_quality() -> String {
+    "hq".into()
 }
 
 fn default_enabled_sources() -> Vec<MusicSourceId> {
@@ -255,6 +296,7 @@ impl Default for AppSettings {
             limit_per_source: default_limit(),
             download_dir: String::new(),
             sources_dir: String::new(),
+            quality: default_quality(),
         }
     }
 }
@@ -290,9 +332,50 @@ pub fn infer_quality_from_url(url: Option<&str>) -> (Option<String>, Option<Stri
         (Some("lossless".into()), Some("LOSSLESS".into()))
     } else if lower.contains("320") || lower.contains("hq") {
         (Some("hq".into()), Some("HQ".into()))
-    } else if lower.contains("128") {
-        (Some("standard".into()), Some("STD".into()))
     } else {
         (Some("standard".into()), Some("STD".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_round_trips_through_id() {
+        for q in [AudioQuality::Standard, AudioQuality::Hq, AudioQuality::Lossless] {
+            assert_eq!(AudioQuality::from_id(q.id()), q);
+        }
+    }
+
+    #[test]
+    fn unknown_quality_falls_back_to_hq() {
+        assert_eq!(AudioQuality::from_id(""), AudioQuality::Hq);
+        assert_eq!(AudioQuality::from_id("  "), AudioQuality::Hq);
+        assert_eq!(AudioQuality::from_id("bogus"), AudioQuality::Hq);
+    }
+
+    #[test]
+    fn quality_aliases_are_accepted() {
+        assert_eq!(AudioQuality::from_id("STD"), AudioQuality::Standard);
+        assert_eq!(AudioQuality::from_id("Flac"), AudioQuality::Lossless);
+        assert_eq!(AudioQuality::from_id(" LOSSLESS "), AudioQuality::Lossless);
+    }
+
+    #[test]
+    fn infers_quality_from_url() {
+        assert_eq!(
+            infer_quality_from_url(Some("https://x/y.flac")).0.as_deref(),
+            Some("lossless")
+        );
+        assert_eq!(
+            infer_quality_from_url(Some("https://x/y-320.mp3")).0.as_deref(),
+            Some("hq")
+        );
+        assert_eq!(
+            infer_quality_from_url(Some("https://x/y-128.mp3")).0.as_deref(),
+            Some("standard")
+        );
+        assert_eq!(infer_quality_from_url(None), (None, None));
     }
 }

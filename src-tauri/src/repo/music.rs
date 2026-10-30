@@ -3,17 +3,20 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
 
-use crate::model::{MusicSourceId, SearchPageResult, SourceSearchError, Track};
+use crate::model::{AudioQuality, MusicSourceId, SearchPageResult, SourceSearchError, Track};
 use crate::source::MusicSources;
 
 pub struct MusicRepository {
     cache: Mutex<HashMap<String, Track>>,
+    /// Detailed tracks (with play URLs) keyed by `uid|quality`.
+    details_cache: Mutex<HashMap<String, Track>>,
 }
 
 impl MusicRepository {
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            details_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -91,10 +94,16 @@ impl MusicRepository {
         })
     }
 
-    pub async fn ensure_playable(&self, sources: &MusicSources, track: Track) -> Track {
+    pub async fn ensure_playable(
+        &self,
+        sources: &MusicSources,
+        track: Track,
+        quality: AudioQuality,
+    ) -> Track {
+        let key = format!("{}|{}", track.uid, quality.id());
         {
-            let cache = self.cache.lock();
-            if let Some(cached) = cache.get(&track.uid) {
+            let cache = self.details_cache.lock();
+            if let Some(cached) = cache.get(&key) {
                 let has_audio = !cached.audio_url.as_deref().unwrap_or("").is_empty();
                 let has_lrc = !cached.lrc.as_deref().unwrap_or("").is_empty();
                 // Re-fetch when lyrics are still missing — local playback used to skip this.
@@ -108,10 +117,13 @@ impl MusicRepository {
             return track;
         }
 
-        let detailed = sources.fetch_details(track.clone()).await.unwrap_or(track);
-        self.cache
+        let detailed = sources
+            .fetch_details(track.clone(), quality)
+            .await
+            .unwrap_or(track);
+        self.details_cache
             .lock()
-            .insert(detailed.uid.clone(), detailed.clone());
+            .insert(key, detailed.clone());
         detailed
     }
 }

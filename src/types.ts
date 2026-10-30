@@ -54,6 +54,8 @@ export interface AppSettings {
   downloadDir: string;
   /** Directory of `*.json` source manifests; empty uses app data sources/ */
   sourcesDir: string;
+  /** Streaming quality preference: standard / hq / lossless */
+  quality: string;
 }
 
 /** Preset download locations (used on Android where folder picker is unavailable). */

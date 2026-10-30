@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 use tokio::task::JoinSet;
 
-use crate::model::{infer_quality_from_url, MusicSourceId, Track};
+use crate::model::{infer_quality_from_url, AudioQuality, MusicSourceId, Track};
 
 use super::get_text;
 
@@ -115,7 +115,11 @@ impl QqMusicSource {
         }
     }
 
-    pub async fn fetch_details(&self, track: Track) -> Result<Track, String> {
+    pub async fn fetch_details(
+        &self,
+        track: Track,
+        quality: AudioQuality,
+    ) -> Result<Track, String> {
         let msg = if !track.qq_search_key.is_empty() {
             track.qq_search_key.clone()
         } else if !track.keyword.is_empty() {
@@ -148,7 +152,7 @@ impl QqMusicSource {
             return Ok(track);
         }
 
-        let (url, tag, label) = pick_best_play_url(&d);
+        let (url, tag, label) = pick_best_play_url(&d, quality);
         let pay = first_str(&d, &["vip", "pay"]).or(track.pay.clone());
         let mut updated = Track {
             title: first_str(&d, &["song_title", "song_name"]).unwrap_or(track.title),
@@ -175,20 +179,36 @@ impl QqMusicSource {
     }
 }
 
-fn pick_best_play_url(d: &Map<String, Value>) -> (Option<String>, Option<String>, Option<String>) {
+fn pick_best_play_url(
+    d: &Map<String, Value>,
+    quality: AudioQuality,
+) -> (Option<String>, Option<String>, Option<String>) {
     // Paid QQ songs often return empty strings for every play_url field.
-    const CANDIDATES: &[(&str, &str, &str)] = &[
+    const LOSSLESS: &[(&str, &str, &str)] = &[
         ("song_play_url_sq", "lossless", "LOSSLESS"),
         ("song_play_url_pq", "lossless", "LOSSLESS"),
+    ];
+    const HQ: &[(&str, &str, &str)] = &[
         ("song_play_url_accom", "hq", "HQ"),
         ("song_play_url_hq", "hq", "HQ"),
+    ];
+    const STANDARD: &[(&str, &str, &str)] = &[
         ("song_play_url_standard", "standard", "STD"),
         ("song_play_url", "standard", "STD"),
-        ("song_play_url_fq", "low", "LOW"),
     ];
-    for (key, tag, label) in CANDIDATES {
-        if let Some(url) = d.get(*key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-            return (Some(url.to_string()), Some((*tag).into()), Some((*label).into()));
+    const LOW: &[(&str, &str, &str)] = &[("song_play_url_fq", "low", "LOW")];
+
+    // Try the preferred tier first, then fall back to anything playable.
+    let tiers: Vec<&[(&str, &str, &str)]> = match quality {
+        AudioQuality::Lossless => vec![LOSSLESS, HQ, STANDARD, LOW],
+        AudioQuality::Hq => vec![HQ, STANDARD, LOSSLESS, LOW],
+        AudioQuality::Standard => vec![STANDARD, HQ, LOSSLESS, LOW],
+    };
+    for tier in tiers {
+        for (key, tag, label) in tier {
+            if let Some(url) = d.get(*key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                return (Some(url.to_string()), Some((*tag).into()), Some((*label).into()));
+            }
         }
     }
     (None, None, None)

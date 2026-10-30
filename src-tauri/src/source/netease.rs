@@ -1,8 +1,16 @@
 use serde_json::Value;
 
-use crate::model::{infer_quality_from_url, MusicSourceId, Track};
+use crate::model::{AudioQuality, MusicSourceId, Track};
 
 use super::get_text;
+
+fn netease_br(quality: AudioQuality) -> u32 {
+    match quality {
+        AudioQuality::Standard => 128,
+        AudioQuality::Hq => 320,
+        AudioQuality::Lossless => 999,
+    }
+}
 
 pub struct NeteaseMusicSource {
     base_url: String,
@@ -38,13 +46,19 @@ impl NeteaseMusicSource {
         Ok(tracks)
     }
 
-    pub async fn fetch_details(&self, mut track: Track) -> Result<Track, String> {
+    pub async fn fetch_details(
+        &self,
+        mut track: Track,
+        quality: AudioQuality,
+    ) -> Result<Track, String> {
         if !track.song_id.is_empty() {
             if track.audio_url.as_deref().unwrap_or("").is_empty() {
+                // meting `br`: 128 | 192 | 320 | 740 | 999 (999 = lossless).
                 track.audio_url = Some(format!(
-                    "{}?server=netease&type=url&id={}",
+                    "{}?server=netease&type=url&id={}&br={}",
                     self.base_url,
-                    urlencoding::encode(&track.song_id)
+                    urlencoding::encode(&track.song_id),
+                    netease_br(quality)
                 ));
             }
             if track.lrc_url.as_deref().unwrap_or("").is_empty() {
@@ -56,9 +70,8 @@ impl NeteaseMusicSource {
             }
         }
 
-        let (q, label) = infer_quality_from_url(track.audio_url.as_deref());
-        track.quality = q;
-        track.quality_label = label;
+        track.quality = Some(quality.id().to_string());
+        track.quality_label = Some(quality.label().to_string());
 
         if track.lrc.as_deref().unwrap_or("").is_empty() {
             if let Some(lrc_url) = track.lrc_url.clone() {

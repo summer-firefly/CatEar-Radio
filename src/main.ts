@@ -52,6 +52,12 @@ const SOURCE_LABEL: Record<string, string> = {
   kuwo: "酷我",
 };
 
+const QUALITY_OPTIONS: Array<{ id: string; label: string }> = [
+  { id: "standard", label: "标准 (128k)" },
+  { id: "hq", label: "高品质 (320k)" },
+  { id: "lossless", label: "无损 (FLAC)" },
+];
+
 const VOLUME_KEY = "maoer-volume";
 const RECENT_KEY = "maoer-recent";
 const RECENT_MAX = 50;
@@ -158,6 +164,7 @@ const state = {
     limitPerSource: 10,
     downloadDir: "",
     sourcesDir: "",
+    quality: "hq",
   } as AppSettings,
   defaultDownloadDir: "",
   defaultSourcesDir: "",
@@ -699,6 +706,7 @@ async function boot() {
       downloadDir: state.settings.downloadDir ?? "",
       sourcesDir: state.settings.sourcesDir ?? "",
       enabledSources: state.settings.enabledSources ?? [],
+      quality: state.settings.quality || "hq",
     };
     if (isAndroid()) {
       void ensureDownloadDirPresets();
@@ -1990,6 +1998,15 @@ function renderSettings(): string {
         }
       </div>
       <div class="settings-card settings-inline">
+        <h3>播放音质</h3>
+        <select class="field-input field-input-sm" id="quality-select">
+          ${QUALITY_OPTIONS.map(
+            (q) =>
+              `<option value="${q.id}" ${(state.settings.quality || "hq") === q.id ? "selected" : ""}>${q.label}</option>`,
+          ).join("")}
+        </select>
+      </div>
+      <div class="settings-card settings-inline">
         <h3>每源结果数</h3>
         <input class="field-input field-input-sm" id="limit-input" type="number" min="5" max="30" value="${state.settings.limitPerSource}" />
       </div>
@@ -2601,11 +2618,14 @@ function bindMainEvents() {
     const downloadDir =
       (document.querySelector("#download-dir-input") as HTMLInputElement | null)?.value.trim() ||
       "";
+    const quality =
+      (document.querySelector("#quality-select") as HTMLSelectElement | null)?.value || "hq";
     void saveSettings({
       ...state.settings,
       enabledSources: enabled,
       limitPerSource: Math.min(30, Math.max(5, limit || 10)),
       downloadDir,
+      quality,
     });
   });
 }

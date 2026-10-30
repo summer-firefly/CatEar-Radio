@@ -1,6 +1,6 @@
 use serde_json::{Map, Value};
 
-use crate::model::{infer_quality_from_url, MusicSourceId, Track};
+use crate::model::{infer_quality_from_url, AudioQuality, MusicSourceId, Track};
 
 use super::get_text;
 
@@ -64,49 +64,70 @@ impl KuwoMusicSource {
             .collect())
     }
 
-    pub async fn fetch_details(&self, track: Track) -> Result<Track, String> {
+    pub async fn fetch_details(
+        &self,
+        track: Track,
+        quality: AudioQuality,
+    ) -> Result<Track, String> {
         let n = track.display_index.max(1);
-        // br=1 returns flac (often fails in WKWebView); br=320 returns mp3.
-        let url = format!(
-            "{}?msg={}&n={n}&br=320",
-            self.base_url,
-            urlencoding::encode(&track.keyword)
-        );
-
         let mut out = track;
-        if let Ok(body) = get_text(&url).await {
-            if let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&body) {
-                if let Some(Value::Object(d)) = root.get("data") {
-                    let audio_url = d
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .or(out.audio_url.clone());
-                    let quality_text =
-                        format!("{} {}", str_field(d, "level"), str_field(d, "format")).to_lowercase();
-                    let (quality, quality_label) = if RegexLike::lossless(&quality_text) {
-                        (Some("lossless".into()), Some("LOSSLESS".into()))
-                    } else {
-                        infer_quality_from_url(audio_url.as_deref())
-                    };
-
-                    let song_id = opt_str(d, "rid").unwrap_or(out.song_id.clone());
-                    let lrc = first_str(d, &["lyric", "lrc", "lyrics"]).or(out.lrc.clone());
-                    out = Track {
-                        title: opt_str(d, "song").unwrap_or(out.title),
-                        artist: opt_str(d, "singer").unwrap_or(out.artist),
-                        album: opt_str(d, "album").unwrap_or(out.album),
-                        cover: opt_str(d, "picture").or(out.cover),
-                        song_id,
-                        audio_url,
-                        lrc,
-                        lrc_url: None,
-                        quality,
-                        quality_label,
-                        ..out
-                    };
+        // br=1 returns flac (often fails in WKWebView), br=320 mp3.
+        // Lossless asks for flac first and falls back to mp3 when the API has none.
+        let candidates: &[u32] = match quality {
+            AudioQuality::Lossless => &[1, 320],
+            AudioQuality::Hq => &[320],
+            AudioQuality::Standard => &[320],
+        };
+        let mut payload: Option<Map<String, Value>> = None;
+        for br in candidates {
+            let url = format!(
+                "{}?msg={}&n={n}&br={br}",
+                self.base_url,
+                urlencoding::encode(&out.keyword)
+            );
+            let Ok(body) = get_text(&url).await else {
+                continue;
+            };
+            let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&body) else {
+                continue;
+            };
+            if let Some(Value::Object(d)) = root.get("data") {
+                if d.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some() {
+                    payload = Some(d.clone());
+                    break;
                 }
             }
+        }
+
+        if let Some(d) = payload {
+            let audio_url = d
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or(out.audio_url.clone());
+            let quality_text =
+                format!("{} {}", str_field(&d, "level"), str_field(&d, "format")).to_lowercase();
+            let (quality_id, quality_label) = if RegexLike::lossless(&quality_text) {
+                (Some("lossless".into()), Some("LOSSLESS".into()))
+            } else {
+                infer_quality_from_url(audio_url.as_deref())
+            };
+
+            let song_id = opt_str(&d, "rid").unwrap_or(out.song_id.clone());
+            let lrc = first_str(&d, &["lyric", "lrc", "lyrics"]).or(out.lrc.clone());
+            out = Track {
+                title: opt_str(&d, "song").unwrap_or(out.title),
+                artist: opt_str(&d, "singer").unwrap_or(out.artist),
+                album: opt_str(&d, "album").unwrap_or(out.album),
+                cover: opt_str(&d, "picture").or(out.cover),
+                song_id,
+                audio_url,
+                lrc,
+                lrc_url: None,
+                quality: quality_id,
+                quality_label,
+                ..out
+            };
         }
 
         // oiapi detail often has no lyrics; always try Kuwo open API by musicId.

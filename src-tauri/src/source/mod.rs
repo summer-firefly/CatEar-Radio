@@ -10,7 +10,7 @@ pub use qq::QqMusicSource;
 
 use std::collections::HashMap;
 
-use crate::model::{MusicSourceId, Track};
+use crate::model::{AudioQuality, MusicSourceId, Track};
 
 #[derive(Clone, Default)]
 pub struct MusicSources {
@@ -56,12 +56,20 @@ impl MusicSources {
         }
     }
 
-    pub async fn fetch_details(&self, track: Track) -> Result<Track, String> {
+    pub async fn fetch_details(
+        &self,
+        track: Track,
+        quality: AudioQuality,
+    ) -> Result<Track, String> {
         let base = self.require_base(track.source)?;
         match track.source {
-            MusicSourceId::Netease => NeteaseMusicSource::new(base).fetch_details(track).await,
-            MusicSourceId::Qq => QqMusicSource::new(base).fetch_details(track).await,
-            MusicSourceId::Kuwo => KuwoMusicSource::new(base).fetch_details(track).await,
+            MusicSourceId::Netease => {
+                NeteaseMusicSource::new(base)
+                    .fetch_details(track, quality)
+                    .await
+            }
+            MusicSourceId::Qq => QqMusicSource::new(base).fetch_details(track, quality).await,
+            MusicSourceId::Kuwo => KuwoMusicSource::new(base).fetch_details(track, quality).await
         }
     }
 }

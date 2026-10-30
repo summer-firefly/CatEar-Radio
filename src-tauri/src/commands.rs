@@ -266,10 +266,14 @@ pub async fn ensure_playable(
 ) -> Result<Track, String> {
     let settings = state.settings.get();
     let dir = resolve_download_dir(&app, &settings);
+    let quality = crate::model::AudioQuality::from_id(&settings.quality);
 
     let (_, sources) = load_sources(&app, &settings);
     // Always resolve details (lyrics etc.); local file only overrides the audio URL.
-    let mut out = state.music.ensure_playable(&sources, track.clone()).await;
+    let mut out = state
+        .music
+        .ensure_playable(&sources, track.clone(), quality)
+        .await;
     if let Some(local) = find_local_audio(&dir, &track) {
         out.title = if out.title.trim().is_empty() {
             track.title.clone()
@@ -461,7 +465,7 @@ pub async fn download_track(
 
     let client = reqwest::Client::builder()
         .user_agent("MaoerRadio/0.1")
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
