@@ -1135,6 +1135,13 @@ button {
   background: rgba(107, 182, 255, 0.18);
 }
 
+/* Download in flight: percentage text is wider than the icon, so shrink the font. */
+.fav-btn.is-downloading {
+  color: var(--accent-soft);
+  font-size: 0.62rem;
+  font-variant-numeric: tabular-nums;
+}
+
 .icon-btn {
   min-width: 36px;
   height: 36px;

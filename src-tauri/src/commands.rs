@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::model::{
     AppSettings, LibrarySnapshot, RecommendCatalog, SearchPageResult, SourceInfo, StoredPlaylist,
@@ -430,6 +430,71 @@ pub struct DownloadResult {
     pub already_exists: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    uid: String,
+    downloaded: u64,
+    total: u64,
+}
+
+/// Stream the response body straight to disk so large FLAC files never sit in RAM.
+async fn stream_to_file(
+    app: &AppHandle,
+    uid: &str,
+    url: &str,
+    path: &Path,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    let client = reqwest::Client::builder()
+        .user_agent("MaoerRadio/0.1")
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("下载失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载失败：HTTP {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+
+    let mut file = std::fs::File::create(path).map_err(|e| format!("写入文件失败：{e}"))?;
+    let mut downloaded: u64 = 0;
+    let mut last_emit: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读取音频失败：{e}"))?;
+        file.write_all(&chunk)
+            .map_err(|e| format!("写入文件失败：{e}"))?;
+        downloaded += chunk.len() as u64;
+        // Emit at most every 256 KB to keep the event bridge quiet.
+        if downloaded - last_emit >= 256 * 1024 || downloaded == total {
+            last_emit = downloaded;
+            let _ = app.emit(
+                "download-progress",
+                DownloadProgress {
+                    uid: uid.to_string(),
+                    downloaded,
+                    total,
+                },
+            );
+        }
+    }
+    file.sync_all().map_err(|e| format!("写入文件失败：{e}"))?;
+    drop(file);
+
+    if downloaded == 0 {
+        let _ = std::fs::remove_file(path);
+        return Err("下载内容为空".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn download_track(
     app: AppHandle,
@@ -448,7 +513,11 @@ pub async fn download_track(
     }
 
     let (_, sources) = load_sources(&app, &settings);
-    let detailed = state.music.ensure_playable(&sources, track).await;
+    let quality = crate::model::AudioQuality::from_id(&settings.quality);
+    let detailed = state
+        .music
+        .ensure_playable(&sources, track, quality)
+        .await;
 
     if let Some(existing) = find_local_audio(&dir, &detailed) {
         return Ok(DownloadResult {
@@ -461,33 +530,14 @@ pub async fn download_track(
         .audio_url
         .as_deref()
         .filter(|u| !u.is_empty())
-        .ok_or_else(|| "暂无可用下载地址".to_string())?;
-
-    let client = reqwest::Client::builder()
-        .user_agent("MaoerRadio/0.1")
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("下载失败：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("下载失败：HTTP {}", resp.status()));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("读取音频失败：{e}"))?;
-    if bytes.is_empty() {
-        return Err("下载内容为空".into());
-    }
+        .ok_or_else(|| "暂无可用下载地址".to_string())?
+        .to_string();
 
     let stem = track_filename_stem(&detailed);
-    let ext = guess_ext(url);
+    let ext = guess_ext(&url);
     let path = unique_path(&dir, &stem, ext);
-    std::fs::write(&path, &bytes).map_err(|e| format!("写入文件失败：{e}"))?;
+    stream_to_file(&app, &detailed.uid, &url, &path).await?;
+
     Ok(DownloadResult {
         path: path.to_string_lossy().into_owned(),
         already_exists: false,

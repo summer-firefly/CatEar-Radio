@@ -171,6 +171,10 @@ const state = {
   defaultDownloadDir: "",
   defaultSourcesDir: "",
   downloadingUid: "" as string,
+  /** Queue of tracks waiting for the single download slot. */
+  downloadQueue: [] as Track[],
+  /** Live byte progress of in-flight downloads, keyed by track uid. */
+  downloadProgress: {} as Record<string, { downloaded: number; total: number }>,
   sources: [] as SourceInfo[],
   library: null as LibrarySnapshot | null,
   libraryPane: "favorites" as "favorites" | "recent" | "playlists",
@@ -720,6 +724,7 @@ async function boot() {
   render();
   void refreshRecommend(false);
   void listenRecommendUpdates();
+  void listenDownloadProgress();
 
   let resizeTimer = 0;
   let lastListPageSize = calcListPageSize();
@@ -1209,24 +1214,84 @@ async function importSourceFromFile() {
   }
 }
 
-async function downloadTrack(track: Track) {
-  if (state.downloadingUid) {
-    toast("已有下载任务进行中");
+function downloadTrack(track: Track) {
+  if (state.downloadingUid === track.uid || state.downloadQueue.some((t) => t.uid === track.uid)) {
+    toast("该歌曲已在下载队列中");
     return;
   }
-  state.downloadingUid = track.uid;
-  render();
+  state.downloadQueue.push(track);
+  if (state.downloadingUid) {
+    toast(`已加入下载队列（队列 ${state.downloadQueue.length}）`);
+    render();
+    return;
+  }
+  void drainDownloadQueue();
+}
+
+/** Downloads run one at a time — parallel pulls starve playback bandwidth. */
+async function drainDownloadQueue() {
+  while (state.downloadQueue.length) {
+    const track = state.downloadQueue.shift()!;
+    state.downloadingUid = track.uid;
+    delete state.downloadProgress[track.uid];
+    render();
+    try {
+      const result = await invoke<{ path: string; alreadyExists: boolean }>("download_track", {
+        track,
+      });
+      toast(
+        result.alreadyExists
+          ? `已存在，无需重复下载：${result.path}`
+          : `已下载：${result.path}`,
+      );
+    } catch (e) {
+      toast(`下载失败：${String(e)}`);
+    } finally {
+      state.downloadingUid = "";
+      delete state.downloadProgress[track.uid];
+      render();
+    }
+  }
+}
+
+/** Short human-readable byte size, e.g. 3.4M. */
+function formatBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}M`;
+  if (n >= 1024) return `${Math.round(n / 1024)}K`;
+  return `${n}B`;
+}
+
+/** Download icon / percentage shown in each row action group. */
+function downloadBadgeText(uid: string): string {
+  if (state.downloadingUid !== uid) return "⬇";
+  const p = state.downloadProgress[uid];
+  if (!p) return "…";
+  if (!p.total) return formatBytes(p.downloaded);
+  return `${Math.min(100, Math.round((p.downloaded / p.total) * 100))}%`;
+}
+
+/** Patch only the affected row so progress ticks don't repaint whole lists. */
+function patchDownloadBadge(uid: string) {
+  const nodes = document.querySelectorAll<HTMLElement>("[data-dl-uid]");
+  nodes.forEach((node) => {
+    if (node.dataset.dlUid !== uid) return;
+    node.textContent = downloadBadgeText(uid);
+    node.classList.toggle("is-downloading", state.downloadingUid === uid);
+  });
+}
+
+async function listenDownloadProgress() {
   try {
-    const result = await invoke<{ path: string; alreadyExists: boolean }>("download_track", {
-      track,
-    });
-    toast(
-      result.alreadyExists
-        ? `已存在，无需重复下载：${result.path}`
-        : `已下载：${result.path}`,
+    await listen<{ uid: string; downloaded: number; total: number }>(
+      "download-progress",
+      (event) => {
+        const { uid, downloaded, total } = event.payload;
+        state.downloadProgress[uid] = { downloaded, total };
+        patchDownloadBadge(uid);
+      },
     );
   } catch (e) {
-    toast(`下载失败：${String(e)}`);
+    console.error(e);
   } finally {
     state.downloadingUid = "";
     render();
@@ -1707,7 +1772,7 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0, altCo
       ${sourceBadge}
       <div class="row-actions">
         ${plActions}
-        <span class="fav-btn" data-dl-uid="${escapeAttr(track.uid)}" title="下载" role="button">${dlBusy ? "…" : "⬇"}</span>
+        <span class="fav-btn${dlBusy ? " is-downloading" : ""}" data-dl-uid="${escapeAttr(track.uid)}" title="下载" role="button">${downloadBadgeText(track.uid)}</span>
         ${favButton(track.uid)}
       </div>
     </button>
