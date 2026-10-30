@@ -1,5 +1,15 @@
 export type MusicSourceId = "netease" | "qq" | "kuwo";
 
+export interface SourceSearchError {
+  source: MusicSourceId;
+  message: string;
+}
+
+export interface SearchPageResult {
+  tracks: Track[];
+  errors: SourceSearchError[];
+}
+
 export interface Track {
   uid: string;
   source: MusicSourceId;

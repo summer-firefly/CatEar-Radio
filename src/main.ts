@@ -1,9 +1,15 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { listen } from "@tauri-apps/api/event";
+import "./assets/fonts/fonts.css";
 import "./styles.css";
 import logoUrl from "./assets/logo.png";
 import { formatTime, parseLrc } from "./lrc";
+import {
+  initOsMediaControls,
+  syncOsMediaPlaybackState,
+  syncOsMediaPosition,
+  syncOsMediaTrack,
+} from "./os-media";
 import type {
   AppSettings,
   DownloadDirPreset,
@@ -12,7 +18,9 @@ import type {
   PlayMode,
   RecommendCatalog,
   RecommendPlaylist,
+  SearchPageResult,
   SourceInfo,
+  SourceSearchError,
   TabId,
   Track,
 } from "./types";
@@ -23,13 +31,6 @@ function isAndroid(): boolean {
     /android/i.test(navigator.userAgent || "")
   );
 }
-
-type DesktopLyricPayload = {
-  line: string;
-  next: string;
-  title: string;
-  artist: string;
-};
 
 /** Remote URLs pass through; absolute local paths go through asset protocol. */
 function toPlayableSrc(url: string): string {
@@ -52,6 +53,31 @@ const SOURCE_LABEL: Record<string, string> = {
 };
 
 const VOLUME_KEY = "maoer-volume";
+const RECENT_KEY = "maoer-recent";
+const RECENT_MAX = 50;
+const LYRIC_FONT_KEY = "maoer-lyric-font";
+const LYRIC_OFFSET_KEY = "maoer-lyric-offset";
+type LyricFontSize = "sm" | "md" | "lg";
+
+function loadLyricFont(): LyricFontSize {
+  try {
+    const v = localStorage.getItem(LYRIC_FONT_KEY);
+    if (v === "sm" || v === "md" || v === "lg") return v;
+  } catch {
+    /* ignore */
+  }
+  return "md";
+}
+
+function loadLyricOffset(): number {
+  try {
+    const v = Number(localStorage.getItem(LYRIC_OFFSET_KEY));
+    if (Number.isFinite(v)) return Math.max(-10, Math.min(10, Math.round(v * 2) / 2));
+  } catch {
+    /* ignore */
+  }
+  return 0;
+}
 
 function loadVolume(): number {
   try {
@@ -71,11 +97,60 @@ function persistVolume(v: number) {
   }
 }
 
+function loadRecent(): Track[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((x): x is Record<string, unknown> => !!x && typeof x === "object" && typeof (x as { uid?: unknown }).uid === "string")
+      .map((x) => storedToTrack(x as LibrarySnapshot["favorites"][number]))
+      .slice(0, RECENT_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function persistRecent(tracks: Track[]) {
+  try {
+    const compact = tracks.slice(0, RECENT_MAX).map((t) => ({
+      uid: t.uid,
+      source: t.source,
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      cover: t.cover ?? null,
+      songId: t.songId,
+      songMid: t.songMid,
+      qqId: t.qqId,
+      qqSearchKey: t.qqSearchKey,
+      qqIndex: t.qqIndex,
+      keyword: t.keyword,
+      displayIndex: t.displayIndex,
+    }));
+    localStorage.setItem(RECENT_KEY, JSON.stringify(compact));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function pushRecent(track: Track) {
+  const next = [track, ...state.recent.filter((t) => t.uid !== track.uid)].slice(0, RECENT_MAX);
+  state.recent = next;
+  persistRecent(next);
+}
+
 const state = {
   tab: "discover" as TabId,
   keyword: "",
   searching: false,
   searchTracks: [] as Track[],
+  /** Tracks accumulated across search pages for continuous playback. */
+  searchAccum: [] as Track[],
+  searchErrors: [] as SourceSearchError[],
+  searchLoadedMaxPage: 0,
+  /** Whether the active play queue comes from search results. */
+  queueKind: null as null | "search",
   recommend: null as RecommendCatalog | null,
   recommendLoading: false,
   settings: {
@@ -89,7 +164,8 @@ const state = {
   downloadingUid: "" as string,
   sources: [] as SourceInfo[],
   library: null as LibrarySnapshot | null,
-  libraryPane: "favorites" as "favorites" | "playlists",
+  libraryPane: "favorites" as "favorites" | "recent" | "playlists",
+  recent: loadRecent(),
   queue: [] as Track[],
   queueIndex: -1,
   current: null as Track | null,
@@ -103,7 +179,8 @@ const state = {
   playMode: "list" as PlayMode,
   lyrics: [] as LyricLine[],
   lyricsOpen: false,
-  desktopLyrics: false,
+  lyricFont: loadLyricFont() as LyricFontSize,
+  lyricOffset: loadLyricOffset(),
   toast: "",
   page: 1,
   /** Whether a newer search page likely exists (based on last page size). */
@@ -112,16 +189,22 @@ const state = {
   /** Client-side pages for local lists (hot / favorites / recommend playlist browse). */
   hotPage: 1,
   favPage: 1,
+  recentPage: 1,
   browsePlaylistId: null as string | null,
   browsePage: 1,
+  /** Sleep timer: timed countdown or stop after current track. */
+  sleep: null as null | { mode: "timed"; endsAt: number; minutes: number } | { mode: "track" },
   /** One-shot enter animation after a full recommend reload. */
   recommendReveal: false,
   /** In-app dialog — WKWebView has no window.prompt/confirm. */
   dialog: null as
     | null
     | { kind: "new-playlist" }
+    | { kind: "rename-playlist"; id: string; name: string }
     | { kind: "delete-playlist"; id: string; name: string }
     | { kind: "add-to-playlist"; trackUid: string }
+    | { kind: "import-library"; path: string }
+    | { kind: "sleep-timer" }
     | { kind: "pick-download-dir"; options: DownloadDirPreset[] },
   downloadDirPresets: [] as DownloadDirPreset[],
   /** Custom track context menu (native WebView menu only has Reload). */
@@ -165,7 +248,6 @@ let playGeneration = 0;
 let lastMotionTab: TabId | "" = "";
 let lastMotionTrackUid = "";
 let lastMotionLyricsOpen: boolean | null = null;
-let lastDesktopLyricLine = "";
 let searchHistoryDocHandler: ((e: PointerEvent) => void) | null = null;
 
 function detachSearchHistoryDocHandler() {
@@ -330,8 +412,74 @@ function openRecommendPlaylist(pl: RecommendPlaylist) {
 
 function clearSearchResults() {
   state.searchTracks = [];
+  state.searchAccum = [];
+  state.searchErrors = [];
+  state.searchLoadedMaxPage = 0;
   state.page = 1;
   state.searchHasMore = false;
+}
+
+function mergeSearchAccum(tracks: Track[]) {
+  const seen = new Set(state.searchAccum.map((t) => t.uid));
+  for (const track of tracks) {
+    if (seen.has(track.uid)) continue;
+    seen.add(track.uid);
+    state.searchAccum.push(track);
+  }
+}
+
+function formatSearchErrors(errors: SourceSearchError[]): string {
+  return errors
+    .map((e) => `${SOURCE_LABEL[e.source] || e.source}：${e.message}`)
+    .join("；");
+}
+
+function emptyState(icon: string, title: string, hint = ""): string {
+  return `
+    <div class="empty-state">
+      <div class="empty-ico" aria-hidden="true">${escapeHtml(icon)}</div>
+      <div class="empty-title">${escapeHtml(title)}</div>
+      ${hint ? `<div class="empty-hint">${escapeHtml(hint)}</div>` : ""}
+    </div>`;
+}
+
+function persistLyricPrefs() {
+  try {
+    localStorage.setItem(LYRIC_FONT_KEY, state.lyricFont);
+    localStorage.setItem(LYRIC_OFFSET_KEY, String(state.lyricOffset));
+  } catch {
+    /* ignore */
+  }
+}
+
+function cycleLyricFont(delta: number) {
+  const order: LyricFontSize[] = ["sm", "md", "lg"];
+  const i = order.indexOf(state.lyricFont);
+  const next = order[Math.max(0, Math.min(order.length - 1, i + delta))];
+  if (next === state.lyricFont) return;
+  state.lyricFont = next;
+  persistLyricPrefs();
+  const box = document.querySelector<HTMLElement>(".lyrics");
+  if (box) box.dataset.size = next;
+  else render();
+}
+
+function nudgeLyricOffset(delta: number) {
+  state.lyricOffset = Math.max(-10, Math.min(10, Math.round((state.lyricOffset + delta) * 2) / 2));
+  persistLyricPrefs();
+  const label = document.querySelector("#lyric-offset-label");
+  if (label) {
+    label.textContent = formatLyricOffset(state.lyricOffset);
+  } else {
+    render();
+  }
+  lastLyricScrollIdx = -1;
+  syncLyricsHighlight({ forceScroll: true });
+}
+
+function formatLyricOffset(v: number): string {
+  if (v === 0) return "±0s";
+  return `${v > 0 ? "+" : ""}${v}s`;
 }
 
 function goLocalListPage(key: string, delta: number) {
@@ -339,9 +487,11 @@ function goLocalListPage(key: string, delta: number) {
   if (key === "hot") {
     const total = state.recommend?.hotTracks.length ?? 0;
     state.hotPage = clampPage(state.hotPage + delta, total, pageSize);
-  } else if (key === "fav") {
+  } else   if (key === "fav") {
     const total = state.library?.favorites.length ?? 0;
     state.favPage = clampPage(state.favPage + delta, total, pageSize);
+  } else if (key === "recent") {
+    state.recentPage = clampPage(state.recentPage + delta, state.recent.length, pageSize);
   } else if (key === "browse") {
     const pl = browsingPlaylist();
     const total = pl?.tracks.length ?? 0;
@@ -356,8 +506,77 @@ function syncLocalPagesToSize() {
   const pageSize = calcListPageSize();
   state.hotPage = clampPage(state.hotPage, state.recommend?.hotTracks.length ?? 0, pageSize);
   state.favPage = clampPage(state.favPage, state.library?.favorites.length ?? 0, pageSize);
+  state.recentPage = clampPage(state.recentPage, state.recent.length, pageSize);
   const pl = browsingPlaylist();
   state.browsePage = clampPage(state.browsePage, pl?.tracks.length ?? 0, pageSize);
+}
+
+let sleepTimeoutId = 0;
+let sleepTickId = 0;
+
+function sleepLabel(): string {
+  if (!state.sleep) return "定时";
+  if (state.sleep.mode === "track") return "播完停";
+  const left = Math.max(0, state.sleep.endsAt - Date.now());
+  const mins = Math.floor(left / 60000);
+  const secs = Math.floor((left % 60000) / 1000);
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function patchSleepBtn() {
+  const btn = document.querySelector("#btn-sleep");
+  if (!btn) return;
+  btn.textContent = sleepLabel();
+  btn.classList.toggle("is-active", !!state.sleep);
+  btn.setAttribute("title", state.sleep ? "定时关闭中 · 点击调整" : "定时关闭");
+}
+
+function clearSleepTimer(silent = false) {
+  if (sleepTimeoutId) {
+    window.clearTimeout(sleepTimeoutId);
+    sleepTimeoutId = 0;
+  }
+  if (sleepTickId) {
+    window.clearInterval(sleepTickId);
+    sleepTickId = 0;
+  }
+  const had = !!state.sleep;
+  state.sleep = null;
+  patchSleepBtn();
+  if (had && !silent) toast("已取消定时");
+}
+
+function fireSleepTimer() {
+  audio.pause();
+  state.playing = false;
+  clearSleepTimer(true);
+  syncOsMediaPlaybackState(false);
+  toast("定时结束，已暂停播放");
+  patchSleepBtn();
+}
+
+function setSleepMinutes(minutes: number) {
+  clearSleepTimer(true);
+  const endsAt = Date.now() + minutes * 60_000;
+  state.sleep = { mode: "timed", endsAt, minutes };
+  sleepTimeoutId = window.setTimeout(() => fireSleepTimer(), minutes * 60_000);
+  sleepTickId = window.setInterval(patchSleepBtn, 1000);
+  state.dialog = null;
+  toast(`将在 ${minutes} 分钟后暂停`);
+  render();
+}
+
+function setSleepAfterTrack() {
+  clearSleepTimer(true);
+  state.sleep = { mode: "track" };
+  state.dialog = null;
+  toast("本曲结束后暂停");
+  render();
+}
+
+function openSleepTimerDialog() {
+  state.dialog = { kind: "sleep-timer" };
+  render();
 }
 
 /** Prefer https for remote media (Kuwo often returns http://). */
@@ -413,6 +632,35 @@ function applyPlatformChrome() {
   }
 }
 
+function pushOsMediaTrack() {
+  const t = state.current;
+  if (!t) {
+    void syncOsMediaTrack(null, false, 0, 0);
+    return;
+  }
+  void syncOsMediaTrack(
+    {
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      artworkUrl: t.cover,
+    },
+    state.playing,
+    state.position,
+    state.duration || audio.duration || 0,
+  );
+}
+
+function seekTo(seconds: number) {
+  if (!Number.isFinite(seconds)) return;
+  const dur = audio.duration || state.duration || 0;
+  const next = dur > 0 ? Math.min(Math.max(0, seconds), dur) : Math.max(0, seconds);
+  audio.currentTime = next;
+  state.position = next;
+  patchPlayerChrome();
+  syncOsMediaPosition(next, dur);
+}
+
 async function boot() {
   applyPlatformChrome();
   // Kill the default WebView menu (only "Reload") — we show our own on tracks.
@@ -421,6 +669,24 @@ async function boot() {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && state.contextMenu) closeContextMenu();
+  });
+  void initOsMediaControls({
+    play: () => {
+      if (!state.current) return;
+      if (!state.playing) playPause();
+    },
+    pause: () => {
+      if (state.playing) playPause();
+    },
+    stop: () => {
+      audio.pause();
+      state.playing = false;
+      seekTo(0);
+      syncOsMediaPlaybackState(false);
+    },
+    next: () => skip(1),
+    previous: () => skip(-1),
+    seek: (seconds) => seekTo(seconds),
   });
   try {
     state.sources = await invoke<SourceInfo[]>("list_sources");
@@ -443,7 +709,6 @@ async function boot() {
   render();
   void refreshRecommend(false);
   void listenRecommendUpdates();
-  void listenDesktopLyricsReady();
 
   let resizeTimer = 0;
   let lastListPageSize = calcListPageSize();
@@ -461,113 +726,6 @@ async function boot() {
       }
     }, 280);
   });
-}
-
-async function listenDesktopLyricsReady() {
-  try {
-    await listen("desktop-lyrics-ready", () => {
-      void syncDesktopLyrics(true);
-    });
-  } catch (e) {
-    console.error(e);
-  }
-}
-
-function currentDesktopLyricPayload(): DesktopLyricPayload {
-  const title = state.current?.title || "";
-  const artist = state.current?.artist || "";
-  if (!state.lyrics.length) {
-    return {
-      line: title || "暂无歌词",
-      next: artist,
-      title,
-      artist,
-    };
-  }
-  let idx = 0;
-  for (let i = 0; i < state.lyrics.length; i++) {
-    const next = state.lyrics[i + 1];
-    if (state.position >= state.lyrics[i].time && (!next || state.position < next.time)) {
-      idx = i;
-      break;
-    }
-    if (state.position < state.lyrics[0].time) {
-      idx = 0;
-      break;
-    }
-    if (i === state.lyrics.length - 1) idx = i;
-  }
-  return {
-    line: state.lyrics[idx]?.text || title || "暂无歌词",
-    next: state.lyrics[idx + 1]?.text || "",
-    title,
-    artist,
-  };
-}
-
-async function syncDesktopLyrics(force = false) {
-  if (!state.desktopLyrics) return;
-  const payload = currentDesktopLyricPayload();
-  if (!force && payload.line === lastDesktopLyricLine) return;
-  lastDesktopLyricLine = payload.line;
-  try {
-    await emit("desktop-lyrics-sync", payload);
-  } catch {
-    // Window may have closed between checks.
-  }
-}
-
-function patchDesktopLyricsBtn() {
-  const btn = document.querySelector("#btn-desktop-lyrics");
-  if (btn) btn.textContent = state.desktopLyrics ? "关闭桌面歌词" : "桌面歌词";
-}
-
-async function toggleDesktopLyrics() {
-  try {
-    const existing = await WebviewWindow.getByLabel("desktop-lyrics");
-    if (existing) {
-      await existing.close();
-      state.desktopLyrics = false;
-      lastDesktopLyricLine = "";
-      patchDesktopLyricsBtn();
-      return;
-    }
-
-    const win = new WebviewWindow("desktop-lyrics", {
-      url: "desktop-lyrics.html",
-      title: "桌面歌词",
-      width: 920,
-      height: 120,
-      minWidth: 320,
-      minHeight: 96,
-      center: true,
-      transparent: true,
-      decorations: false,
-      alwaysOnTop: true,
-      skipTaskbar: true,
-      resizable: true,
-      shadow: false,
-      focus: false,
-    });
-
-    win.once("tauri://created", () => {
-      state.desktopLyrics = true;
-      patchDesktopLyricsBtn();
-      void syncDesktopLyrics(true);
-    });
-    win.once("tauri://error", (e) => {
-      state.desktopLyrics = false;
-      patchDesktopLyricsBtn();
-      toast(`桌面歌词打开失败：${String(e.payload ?? e)}`);
-    });
-    win.once("tauri://destroyed", () => {
-      state.desktopLyrics = false;
-      lastDesktopLyricLine = "";
-      patchDesktopLyricsBtn();
-    });
-  } catch (e) {
-    toast(`桌面歌词打开失败：${String(e)}`);
-  }
 }
 
 async function listenRecommendUpdates() {
@@ -665,6 +823,17 @@ function toggleLyrics(force?: boolean) {
   render();
 }
 
+async function invokeSearchPage(page: number, reset: boolean): Promise<SearchPageResult> {
+  const pageSize = calcSearchPageSize();
+  const limitPerSource = searchLimitPerSource(pageSize);
+  return invoke<SearchPageResult>("search_tracks", {
+    keyword: state.keyword.trim(),
+    page,
+    reset,
+    limitPerSource,
+  });
+}
+
 async function fetchSearchPage(page: number, isNewSearch: boolean) {
   const keyword = state.keyword.trim();
   if (!keyword || page < 1 || state.searching) return;
@@ -672,43 +841,97 @@ async function fetchSearchPage(page: number, isNewSearch: boolean) {
   const prevPage = state.page;
   const prevTracks = state.searchTracks;
   const prevHasMore = state.searchHasMore;
+  const prevErrors = state.searchErrors;
   const pageSize = calcSearchPageSize();
-  const limitPerSource = searchLimitPerSource(pageSize);
   state.page = page;
   state.searching = true;
   renderMain();
   try {
-    // reset:true so each page is independent (not append/accumulate).
-    const tracks = await invoke<Track[]>("search_tracks", {
-      keyword,
-      page,
-      reset: true,
-      limitPerSource,
-    });
+    // reset:true so each displayed page is independent (backend cache cleared).
+    const result = await invokeSearchPage(page, true);
+    const tracks = result.tracks ?? [];
+    const errors = result.errors ?? [];
+    state.searchErrors = errors;
+
+    if (isNewSearch) {
+      state.searchAccum = [];
+      state.searchLoadedMaxPage = 0;
+    }
+    mergeSearchAccum(tracks);
+    state.searchLoadedMaxPage = Math.max(state.searchLoadedMaxPage, page);
+
     if (!tracks.length) {
       if (page > 1) {
-        toast("没有更多了");
+        toast(errors.length ? `没有更多了（${formatSearchErrors(errors)}）` : "没有更多了");
         state.page = prevPage;
         state.searchTracks = prevTracks;
         state.searchHasMore = false;
+        state.searchErrors = prevErrors;
       } else {
         state.searchTracks = [];
         state.searchHasMore = false;
-        if (isNewSearch) toast("没有找到结果");
+        if (errors.length) {
+          toast(`搜索失败：${formatSearchErrors(errors)}`);
+        } else if (isNewSearch) {
+          toast("没有找到结果");
+        }
       }
       return;
     }
+
     // Keep one screen of rows even if sources return a bit more.
     state.searchTracks = tracks.slice(0, pageSize);
     state.searchHasMore = tracks.length >= pageSize;
+    if (errors.length && isNewSearch) {
+      toast(`部分音源失败：${formatSearchErrors(errors)}`);
+    }
   } catch (e) {
     toast(String(e));
     state.page = prevPage;
     state.searchTracks = prevTracks;
     state.searchHasMore = prevHasMore;
+    state.searchErrors = prevErrors;
   } finally {
     state.searching = false;
     renderMain();
+  }
+}
+
+/** Silently load the next search page into the play queue without changing the UI page. */
+async function extendSearchQueueIfNeeded(): Promise<boolean> {
+  if (state.queueKind !== "search") return false;
+  if (!state.keyword.trim() || !state.searchHasMore || state.searching) return false;
+
+  const nextPage = state.searchLoadedMaxPage + 1;
+  state.searching = true;
+  try {
+    const result = await invokeSearchPage(nextPage, true);
+    const tracks = result.tracks ?? [];
+    if (!tracks.length) {
+      state.searchHasMore = false;
+      if (result.errors?.length) {
+        toast(`无法继续加载：${formatSearchErrors(result.errors)}`);
+      }
+      return false;
+    }
+    mergeSearchAccum(tracks);
+    state.searchLoadedMaxPage = Math.max(state.searchLoadedMaxPage, nextPage);
+    state.searchHasMore = tracks.length >= calcSearchPageSize();
+    if (result.errors?.length) {
+      state.searchErrors = result.errors;
+    }
+
+    const currentUid = state.current?.uid;
+    state.queue = state.searchAccum.slice();
+    state.queueIndex = currentUid
+      ? state.queue.findIndex((t) => t.uid === currentUid)
+      : state.queueIndex;
+    return state.queueIndex >= 0 && state.queueIndex + 1 < state.queue.length;
+  } catch (e) {
+    toast(`加载下一页失败：${String(e)}`);
+    return false;
+  } finally {
+    state.searching = false;
   }
 }
 
@@ -722,15 +945,17 @@ async function goSearchPage(delta: number) {
   await fetchSearchPage(next, false);
 }
 
-async function playTrack(track: Track, queue?: Track[]) {
+async function playTrack(track: Track, queue?: Track[], queueKind: null | "search" = null) {
   const gen = ++playGeneration;
 
   if (queue) {
     state.queue = queue;
     state.queueIndex = queue.findIndex((t) => t.uid === track.uid);
+    state.queueKind = queueKind;
   } else if (state.queueIndex < 0 || state.queue[state.queueIndex]?.uid !== track.uid) {
     state.queue = [track];
     state.queueIndex = 0;
+    state.queueKind = queueKind;
   }
 
   state.preparing = true;
@@ -751,21 +976,24 @@ async function playTrack(track: Track, queue?: Track[]) {
     state.lyrics = parseLrc(detailed.lrc);
     lastLyricScrollIdx = -1;
     lyricsUserScrollUntil = 0;
-    lastDesktopLyricLine = "";
     audio.src = toPlayableSrc(preferHttps(detailed.audioUrl));
     await audio.play();
     if (gen !== playGeneration) return;
     state.playing = true;
-    void syncDesktopLyrics(true);
+    state.duration = audio.duration || 0;
+    state.position = audio.currentTime || 0;
+    pushRecent(detailed);
+    pushOsMediaTrack();
   } catch (e) {
     if (gen !== playGeneration || isAbortError(e)) return;
     toast(`播放失败：${String(e)}`);
     state.playing = false;
+    pushOsMediaTrack();
   } finally {
     if (gen === playGeneration) {
       state.preparing = false;
       render();
-      void syncDesktopLyrics(true);
+      pushOsMediaTrack();
     }
   }
 }
@@ -789,23 +1017,38 @@ function playPause() {
 }
 
 function skip(delta: number) {
+  void skipAsync(delta);
+}
+
+async function skipAsync(delta: number) {
   if (!state.queue.length) return;
   if (state.playMode === "shuffle") {
     const next = Math.floor(Math.random() * state.queue.length);
     state.queueIndex = next;
-    void playTrack(state.queue[next], state.queue);
+    void playTrack(state.queue[next], state.queue, state.queueKind);
     return;
   }
-  const next = state.queueIndex + delta;
+
+  let next = state.queueIndex + delta;
+  if (next >= state.queue.length && delta > 0) {
+    const extended = await extendSearchQueueIfNeeded();
+    if (extended) {
+      next = state.queueIndex + 1;
+      state.queueIndex = next;
+      void playTrack(state.queue[next], state.queue, state.queueKind);
+      return;
+    }
+  }
+
   if (next < 0 || next >= state.queue.length) {
     if (state.playMode === "list" && state.queue.length) {
       state.queueIndex = delta > 0 ? 0 : state.queue.length - 1;
-      void playTrack(state.queue[state.queueIndex], state.queue);
+      void playTrack(state.queue[state.queueIndex], state.queue, state.queueKind);
     }
     return;
   }
   state.queueIndex = next;
-  void playTrack(state.queue[next], state.queue);
+  void playTrack(state.queue[next], state.queue, state.queueKind);
 }
 
 function cyclePlayMode() {
@@ -813,14 +1056,11 @@ function cyclePlayMode() {
   const i = order.indexOf(state.playMode);
   state.playMode = order[(i + 1) % order.length];
   const modeBtn = document.querySelector("#btn-mode-bar");
-  if (modeBtn) modeBtn.textContent = modeLabel();
-  toast(
-    state.playMode === "list"
-      ? "列表循环"
-      : state.playMode === "single"
-        ? "单曲循环"
-        : "随机播放",
-  );
+  if (modeBtn) {
+    modeBtn.textContent = modeLabelShort();
+    modeBtn.setAttribute("title", modeLabel());
+  }
+  toast(modeLabel());
 }
 
 async function toggleFavorite(track: Track) {
@@ -986,6 +1226,11 @@ function openNewPlaylistDialog() {
   render();
 }
 
+function openRenamePlaylistDialog(id: string, name: string) {
+  state.dialog = { kind: "rename-playlist", id, name };
+  render();
+}
+
 async function submitNewPlaylist(name: string) {
   const trimmed = name.trim();
   if (!trimmed) {
@@ -997,6 +1242,23 @@ async function submitNewPlaylist(name: string) {
     state.library = await invoke<LibrarySnapshot>("get_library");
     state.dialog = null;
     toast(`已创建「${trimmed}」`);
+    render();
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+async function submitRenamePlaylist(id: string, name: string) {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    toast("请输入歌单名称");
+    return;
+  }
+  try {
+    await invoke("rename_playlist", { id, name: trimmed });
+    state.library = await invoke<LibrarySnapshot>("get_library");
+    state.dialog = null;
+    toast(`已重命名为「${trimmed}」`);
     render();
   } catch (e) {
     toast(String(e));
@@ -1020,6 +1282,80 @@ async function confirmDeletePlaylist(id: string) {
   }
 }
 
+async function removeTrackFromPlaylist(playlistId: string, trackUid: string) {
+  try {
+    await invoke("remove_from_playlist", { playlistId, trackUid });
+    state.library = await invoke<LibrarySnapshot>("get_library");
+    if (state.contextMenu) state.contextMenu = null;
+    toast("已从歌单移除");
+    render();
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+async function movePlaylistTrack(playlistId: string, fromIndex: number, toIndex: number) {
+  try {
+    await invoke("move_playlist_track", { playlistId, fromIndex, toIndex });
+    state.library = await invoke<LibrarySnapshot>("get_library");
+    render();
+  } catch (e) {
+    toast(String(e));
+  }
+}
+
+async function exportLibraryBackup() {
+  try {
+    if (isAndroid()) {
+      const path = await invoke<string>("export_library_to_download_dir");
+      toast(`已导出：${path}`);
+      return;
+    }
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const stamp = new Date().toISOString().slice(0, 10);
+    const path = await save({
+      title: "导出收藏与歌单",
+      defaultPath: `maoer-library-${stamp}.json`,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) return;
+    await invoke("export_library_to_path", { path });
+    toast("已导出备份");
+  } catch (e) {
+    toast(`导出失败：${String(e)}`);
+  }
+}
+
+async function pickLibraryImport() {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      multiple: false,
+      title: "导入收藏与歌单备份",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    const path = typeof selected === "string" ? selected : null;
+    if (!path) return;
+    state.dialog = { kind: "import-library", path };
+    render();
+  } catch (e) {
+    toast(`选择文件失败：${String(e)}`);
+  }
+}
+
+async function confirmImportLibrary(path: string) {
+  try {
+    await invoke("import_library_from_path", { path });
+    state.library = await invoke<LibrarySnapshot>("get_library");
+    state.dialog = null;
+    state.favPage = 1;
+    toast("已导入备份（覆盖本地收藏与歌单）");
+    render();
+  } catch (e) {
+    toast(`导入失败：${String(e)}`);
+  }
+}
+
 function closeDialog() {
   state.dialog = null;
   render();
@@ -1039,9 +1375,12 @@ function openTrackContextMenu(e: MouseEvent, trackUid: string, queueKey: string)
 }
 
 function queueFromKey(key: string): Track[] {
-  if (key === "search") return state.searchTracks;
+  if (key === "search") {
+    return state.searchAccum.length ? state.searchAccum : state.searchTracks;
+  }
   if (key === "hot") return state.recommend?.hotTracks ?? [];
   if (key === "fav") return (state.library?.favorites ?? []).map(storedToTrack);
+  if (key === "recent") return state.recent.slice();
   if (key === "browse") {
     return browsingPlaylist()?.tracks.slice() ?? [];
   }
@@ -1063,6 +1402,7 @@ function renderContextMenu(): string {
   const track = findTrack(menu.trackUid);
   if (!track) return "";
   const fav = isFavorite(track.uid);
+  const inPlaylist = menu.queueKey.startsWith("pl-");
   // Rough clamp before measure; refined after paint in bindEvents.
   const left = Math.max(8, Math.min(menu.x, window.innerWidth - 180));
   const top = Math.max(8, Math.min(menu.y, window.innerHeight - 200));
@@ -1071,6 +1411,11 @@ function renderContextMenu(): string {
     <div class="ctx-menu" id="ctx-menu" style="left:${left}px;top:${top}px" role="menu">
       <button type="button" class="ctx-item" data-ctx="play" role="menuitem">播放</button>
       <button type="button" class="ctx-item" data-ctx="add-pl" role="menuitem">加入歌单</button>
+      ${
+        inPlaylist
+          ? `<button type="button" class="ctx-item" data-ctx="remove-pl" role="menuitem">从歌单移除</button>`
+          : ""
+      }
       <button type="button" class="ctx-item" data-ctx="fav" role="menuitem">${fav ? "取消收藏" : "收藏"}</button>
       <div class="ctx-sep"></div>
       <button type="button" class="ctx-item" data-ctx="download" role="menuitem">下载</button>
@@ -1117,6 +1462,73 @@ function renderDialog(): string {
           <div class="dialog-actions">
             <button class="btn ghost sm" type="button" id="dialog-cancel">取消</button>
             <button class="btn sm" type="button" id="dialog-ok">创建</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  if (d.kind === "rename-playlist") {
+    return `
+      <div class="dialog-backdrop" id="dialog-backdrop">
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+          <h3 id="dialog-title">重命名歌单</h3>
+          <input id="dialog-input" class="dialog-input" type="text" value="${escapeAttr(d.name)}" maxlength="40" autocomplete="off" />
+          <div class="dialog-actions">
+            <button class="btn ghost sm" type="button" id="dialog-cancel">取消</button>
+            <button class="btn sm" type="button" id="dialog-ok">保存</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  if (d.kind === "import-library") {
+    const fileName = d.path.split(/[/\\]/).pop() || d.path;
+    return `
+      <div class="dialog-backdrop" id="dialog-backdrop">
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+          <h3 id="dialog-title">导入备份</h3>
+          <p class="dialog-msg">将用「${escapeHtml(fileName)}」覆盖当前收藏与自建歌单，此操作不可撤销。确定继续？</p>
+          <div class="dialog-actions">
+            <button class="btn ghost sm" type="button" id="dialog-cancel">取消</button>
+            <button class="btn sm danger" type="button" id="dialog-ok">导入并覆盖</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  if (d.kind === "sleep-timer") {
+    const active = state.sleep
+      ? state.sleep.mode === "track"
+        ? "当前：播完本曲后暂停"
+        : `当前：${state.sleep.minutes} 分钟（剩余 ${sleepLabel()}）`
+      : "当前：未开启";
+    return `
+      <div class="dialog-backdrop" id="dialog-backdrop">
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+          <h3 id="dialog-title">定时关闭</h3>
+          <p class="dialog-msg">${escapeHtml(active)}</p>
+          <div class="dialog-list">
+            <button class="dialog-list-item" type="button" data-sleep="track">
+              <span class="dialog-list-name">播完当前</span>
+              <span class="dialog-list-meta">本曲结束后暂停</span>
+            </button>
+            ${[15, 30, 45, 60]
+              .map(
+                (m) => `
+              <button class="dialog-list-item" type="button" data-sleep="${m}">
+                <span class="dialog-list-name">${m} 分钟</span>
+                <span class="dialog-list-meta">到时暂停播放</span>
+              </button>`,
+              )
+              .join("")}
+            ${
+              state.sleep
+                ? `<button class="dialog-list-item" type="button" data-sleep="off">
+                    <span class="dialog-list-name">关闭定时</span>
+                    <span class="dialog-list-meta">取消自动暂停</span>
+                  </button>`
+                : ""
+            }
+          </div>
+          <div class="dialog-actions">
+            <button class="btn ghost sm" type="button" id="dialog-cancel">取消</button>
           </div>
         </div>
       </div>`;
@@ -1212,6 +1624,8 @@ function escapeAttr(s: string): string {
 function findTrack(uid: string): Track | undefined {
   return (
     state.searchTracks.find((t) => t.uid === uid) ||
+    state.searchAccum.find((t) => t.uid === uid) ||
+    state.recent.find((t) => t.uid === uid) ||
     state.recommend?.hotTracks.find((t) => t.uid === uid) ||
     state.recommend?.hotPlaylists.flatMap((p) => p.tracks).find((t) => t.uid === uid) ||
     state.library?.favorites.map(storedToTrack).find((t) => t.uid === uid) ||
@@ -1252,10 +1666,17 @@ function storedToTrack(s: LibrarySnapshot["favorites"][number]): Track {
   };
 }
 
-function trackRow(track: Track, index: number) {
+function trackRow(track: Track, index: number, queueKey = "", listLen = 0) {
   const active = state.current?.uid === track.uid;
   const idx = String(index + 1).padStart(2, "0");
   const dlBusy = state.downloadingUid === track.uid;
+  const playlistId = queueKey.startsWith("pl-") ? queueKey.slice(3) : "";
+  const plActions = playlistId
+    ? `
+        <span class="fav-btn${index <= 0 ? " is-disabled" : ""}" data-pl-move="up" data-pl-id="${escapeAttr(playlistId)}" data-pl-index="${index}" title="上移" role="button" aria-disabled="${index <= 0}">↑</span>
+        <span class="fav-btn${index >= listLen - 1 ? " is-disabled" : ""}" data-pl-move="down" data-pl-id="${escapeAttr(playlistId)}" data-pl-index="${index}" title="下移" role="button" aria-disabled="${index >= listLen - 1}">↓</span>
+        <span class="fav-btn" data-pl-remove-uid="${escapeAttr(track.uid)}" data-pl-id="${escapeAttr(playlistId)}" title="从歌单移除" role="button">✕</span>`
+    : `<span class="fav-btn" data-add-pl-uid="${escapeAttr(track.uid)}" title="加入歌单" role="button">＋</span>`;
   return `
     <button class="track-row ${active ? "active" : ""}" type="button" data-play-uid="${escapeAttr(track.uid)}">
       <span class="idx">${active && state.playing ? "♪" : idx}</span>
@@ -1267,7 +1688,7 @@ function trackRow(track: Track, index: number) {
       <div class="artist-col">${escapeHtml(track.artist || "未知歌手")}</div>
       <span class="badge">${escapeHtml(SOURCE_LABEL[track.source] || track.source)}</span>
       <div class="row-actions">
-        <span class="fav-btn" data-add-pl-uid="${escapeAttr(track.uid)}" title="加入歌单" role="button">＋</span>
+        ${plActions}
         <span class="fav-btn" data-dl-uid="${escapeAttr(track.uid)}" title="下载" role="button">${dlBusy ? "…" : "⬇"}</span>
         ${favButton(track.uid)}
       </div>
@@ -1276,13 +1697,13 @@ function trackRow(track: Track, index: number) {
 }
 
 function trackList(tracks: Track[], queueKey: string, startIndex = 0): string {
-  if (!tracks.length) return `<div class="empty">暂无歌曲</div>`;
+  if (!tracks.length) return emptyState("♪", "暂无歌曲", "换个关键词或稍后再试");
   return `
     <div class="track-list" data-queue="${escapeAttr(queueKey)}">
       <div class="track-list-head">
         <span>#</span><span></span><span>歌曲</span><span class="col-artist">歌手</span><span>来源</span><span></span>
       </div>
-      ${tracks.map((t, i) => trackRow(t, startIndex + i)).join("")}
+      ${tracks.map((t, i) => trackRow(t, startIndex + i, queueKey, startIndex + tracks.length)).join("")}
     </div>
   `;
 }
@@ -1313,9 +1734,13 @@ function renderDiscover(): string {
     `;
   }
 
-  if (hasSearch) {
+  if (hasSearch || (state.keyword.trim() && (state.searching || state.searchErrors.length))) {
+    const errorBanner = state.searchErrors.length
+      ? `<div class="search-error-banner" role="status">部分音源不可用：${escapeHtml(formatSearchErrors(state.searchErrors))}</div>`
+      : "";
     return `
       <h1 class="page-title">搜索结果<span class="sub">第 ${state.page} 页 · 本页 ${state.searchTracks.length} 首 · 「${escapeHtml(state.keyword)}」</span></h1>
+      ${errorBanner}
       <div class="section">
         <div class="section-head">
           <h2>歌曲</h2>
@@ -1329,7 +1754,13 @@ function renderDiscover(): string {
             }>下一页</button>
           </div>
         </div>
-        ${trackList(state.searchTracks, "search")}
+        ${
+          state.searchTracks.length
+            ? trackList(state.searchTracks, "search")
+            : state.searching
+              ? emptyState("…", "搜索中", "正在向各音源查询")
+              : emptyState("⌕", "没有找到结果", "换个关键词，或检查音源是否可用")
+        }
       </div>
     `;
   }
@@ -1367,7 +1798,7 @@ function renderDiscover(): string {
           </button>`,
                   )
                   .join("")
-              : `<div class="empty">暂无歌单</div>`
+              : emptyState("▦", "暂无歌单", "下拉刷新或稍后再试")
         }
       </div>
     </section>
@@ -1424,22 +1855,32 @@ function renderLibrary(): string {
   const favsAll = (state.library?.favorites ?? []).map(storedToTrack);
   const favs = slicePage(favsAll, state.favPage, calcListPageSize());
   state.favPage = favs.page;
+  const recent = slicePage(state.recent, state.recentPage, calcListPageSize());
+  state.recentPage = recent.page;
   const playlists = state.library?.playlists ?? [];
   const pane = state.libraryPane;
-  const favActive = pane === "favorites";
   return `
-    <h1 class="page-title page-title-sm">我的<span class="sub">收藏与自建歌单</span></h1>
+    <h1 class="page-title page-title-sm">我的<span class="sub">收藏、最近与自建歌单</span></h1>
     <div class="library-stack">
-      <div class="lib-tabs" role="tablist">
-        <button type="button" class="lib-tab ${favActive ? "active" : ""}" data-lib-pane="favorites" role="tab" aria-selected="${favActive}">
-          我喜欢 · ${favsAll.length}
-        </button>
-        <button type="button" class="lib-tab ${!favActive ? "active" : ""}" data-lib-pane="playlists" role="tab" aria-selected="${!favActive}">
-          自建歌单 · ${playlists.length}
-        </button>
+      <div class="lib-toolbar">
+        <div class="lib-tabs" role="tablist">
+          <button type="button" class="lib-tab ${pane === "favorites" ? "active" : ""}" data-lib-pane="favorites" role="tab" aria-selected="${pane === "favorites"}">
+            喜欢 · ${favsAll.length}
+          </button>
+          <button type="button" class="lib-tab ${pane === "recent" ? "active" : ""}" data-lib-pane="recent" role="tab" aria-selected="${pane === "recent"}">
+            最近 · ${state.recent.length}
+          </button>
+          <button type="button" class="lib-tab ${pane === "playlists" ? "active" : ""}" data-lib-pane="playlists" role="tab" aria-selected="${pane === "playlists"}">
+            歌单 · ${playlists.length}
+          </button>
+        </div>
+        <div class="lib-pane-actions">
+          <button class="btn ghost sm" id="btn-export-library" type="button">导出备份</button>
+          <button class="btn ghost sm" id="btn-import-library" type="button">导入备份</button>
+        </div>
       </div>
       ${
-        favActive
+        pane === "favorites"
           ? `<section class="lib-pane">
               ${
                 favsAll.length
@@ -1455,10 +1896,32 @@ function renderLibrary(): string {
                       }
                     </div>
                     ${trackList(favs.items, "fav", favs.startIndex)}`
-                  : `<div class="empty empty-sm">还没有收藏，去发现页点 ♡ 吧</div>`
+                  : emptyState("♡", "还没有收藏", "去发现页点红心，喜欢的歌会出现在这里")
               }
             </section>`
-          : `<section class="lib-pane">
+          : pane === "recent"
+            ? `<section class="lib-pane">
+                ${
+                  state.recent.length
+                    ? `<div class="section-head compact">
+                        <h2>最近播放</h2>
+                        <div class="section-actions">
+                          ${
+                            renderPager({
+                              key: "recent",
+                              page: recent.page,
+                              totalPages: recent.totalPages,
+                              ariaLabel: "最近播放分页",
+                            }) || `<span class="hint">共 ${recent.total} 首</span>`
+                          }
+                          <button class="btn ghost sm" id="btn-clear-recent" type="button">清空</button>
+                        </div>
+                      </div>
+                      ${trackList(recent.items, "recent", recent.startIndex)}`
+                    : emptyState("◷", "还没有播放记录", "听几首歌后，最近播放会出现在这里")
+                }
+              </section>`
+            : `<section class="lib-pane">
               <div class="lib-pane-actions">
                 <button class="btn ghost sm" id="btn-new-playlist" type="button">新建歌单</button>
               </div>
@@ -1473,17 +1936,20 @@ function renderLibrary(): string {
                         <div class="playlist-block">
                           <div class="section-head compact">
                             <h2>${escapeHtml(p.name)} · ${tracks.length}</h2>
-                            <button class="btn ghost sm" data-del-playlist="${escapeAttr(p.id)}" type="button">删除</button>
+                            <div class="section-actions">
+                              <button class="btn ghost sm" data-rename-playlist="${escapeAttr(p.id)}" type="button">重命名</button>
+                              <button class="btn ghost sm" data-del-playlist="${escapeAttr(p.id)}" type="button">删除</button>
+                            </div>
                           </div>
                           ${
                             tracks.length
                               ? trackList(tracks, `pl-${p.id}`)
-                              : `<div class="empty empty-sm">空歌单 · 在歌曲上点 ＋ 加入</div>`
+                              : emptyState("＋", "空歌单", "在歌曲右侧点 ＋ 即可加入")
                           }
                         </div>`;
                       })
                       .join("")
-                  : `<div class="empty empty-sm">还没有自建歌单。建好后，在歌曲右侧点 ＋ 即可加入</div>`
+                  : emptyState("☰", "还没有自建歌单", "点上方「新建歌单」，再在歌曲上点 ＋ 加入")
               }
             </section>`
       }
@@ -1520,7 +1986,7 @@ function renderSettings(): string {
           </label>`,
                 )
                 .join("")}</div>`
-            : `<div class="empty empty-sm">暂无可用音源</div>`
+            : emptyState("◎", "暂无可用音源", "可在上方导入音源 JSON")
         }
       </div>
       <div class="settings-card settings-inline">
@@ -1552,6 +2018,10 @@ function modeLabel(): string {
       : "随机播放";
 }
 
+function modeLabelShort(): string {
+  return state.playMode === "list" ? "列表" : state.playMode === "single" ? "单曲" : "随机";
+}
+
 function renderLyricsPanel(): string {
   const t = state.current;
   if (!t) {
@@ -1560,20 +2030,19 @@ function renderLyricsPanel(): string {
         <h3>歌词</h3>
         <button class="icon-btn" id="btn-close-lyrics" type="button" title="关闭">✕</button>
       </div>
-      <div class="empty">播放歌曲后显示歌词</div>
+      ${emptyState("♩", "还没有在播放", "选一首歌后，歌词会出现在这里")}
     `;
   }
 
+  const activeIdx = activeLyricIndex(state.position);
   const lyricHtml = state.lyrics.length
     ? state.lyrics
         .map((line, idx) => {
-          const next = state.lyrics[idx + 1];
-          const active =
-            state.position >= line.time && (!next || state.position < next.time);
-          return `<div class="${active ? "active-line" : ""}">${escapeHtml(line.text)}</div>`;
+          const active = idx === activeIdx;
+          return `<button type="button" class="lyric-line${active ? " active-line" : ""}" data-lyric-idx="${idx}" title="跳到这句">${escapeHtml(line.text || " ")}</button>`;
         })
         .join("")
-    : `<div class="empty">暂无歌词</div>`;
+    : emptyState("¶", "暂无歌词", "这首歌没有附带 LRC");
 
   return `
     <div class="lp-head">
@@ -1583,8 +2052,16 @@ function renderLyricsPanel(): string {
     <img class="cover lg" src="${escapeAttr(coverUrl(t))}" alt="" />
     <h2 class="np-title">${escapeHtml(t.title)}</h2>
     <p class="np-artist">${escapeHtml(t.artist)} · ${SOURCE_LABEL[t.source] || t.source}</p>
-    <div class="lyrics">${lyricHtml}</div>
-    <div class="lp-head" style="justify-content:center;gap:8px;border-top:1px solid var(--line);padding-top:12px;padding-bottom:16px">
+    <div class="lp-tools" role="toolbar" aria-label="歌词设置">
+      <button class="btn ghost sm" type="button" id="btn-lyric-font-down" title="缩小歌词">A−</button>
+      <button class="btn ghost sm" type="button" id="btn-lyric-font-up" title="放大歌词">A+</button>
+      <span class="lp-tools-sep" aria-hidden="true"></span>
+      <button class="btn ghost sm" type="button" id="btn-lyric-offset-down" title="歌词提前 0.5 秒">−0.5</button>
+      <span class="lp-offset" id="lyric-offset-label" title="歌词时间偏移">${formatLyricOffset(state.lyricOffset)}</span>
+      <button class="btn ghost sm" type="button" id="btn-lyric-offset-up" title="歌词延后 0.5 秒">+0.5</button>
+    </div>
+    <div class="lyrics" data-size="${state.lyricFont}">${lyricHtml}</div>
+    <div class="lp-foot">
       <button class="btn ghost sm" id="btn-fav-np" type="button">${isFavorite(t.uid) ? "已收藏" : "收藏"}</button>
     </div>
   `;
@@ -1714,11 +2191,11 @@ function render() {
             }</button>
             <button class="icon-btn" id="btn-next" type="button" title="下一首">⏭</button>
           </div>
-          <div class="time-row">
-            <span id="time-cur">${formatTime(state.position)}</span>
-            <input class="seek" id="seek" type="range" min="0" max="${Math.max(1, state.duration)}" step="0.1" value="${state.position}" />
-            <span id="time-dur">${formatTime(state.duration)}</span>
-          </div>
+        </div>
+        <div class="time-row">
+          <span id="time-cur">${formatTime(state.position)}</span>
+          <input class="seek" id="seek" type="range" min="0" max="${Math.max(1, state.duration)}" step="0.1" value="${state.position}" />
+          <span id="time-dur">${formatTime(state.duration)}</span>
         </div>
         <div class="player-extra">
           <div class="volume-row" title="音量">
@@ -1736,9 +2213,11 @@ function render() {
               aria-label="音量"
             />
           </div>
-          <button class="mode-btn" id="btn-mode-bar" type="button">${modeLabel()}</button>
-          <button class="mode-btn" id="toggle-lyrics-2" type="button">${showLyrics ? "收起歌词" : "歌词"}</button>
-          <button class="mode-btn" id="btn-desktop-lyrics" type="button">${state.desktopLyrics ? "关闭桌面歌词" : "桌面歌词"}</button>
+          <button class="mode-btn" id="btn-mode-bar" type="button" title="${modeLabel()}">${modeLabelShort()}</button>
+          <button class="mode-btn${state.sleep ? " is-active" : ""}" id="btn-sleep" type="button" title="${
+            state.sleep ? "定时关闭中 · 点击调整" : "定时关闭"
+          }">${sleepLabel()}</button>
+          <button class="mode-btn" id="toggle-lyrics-2" type="button">${showLyrics ? "收起" : "歌词"}</button>
         </div>
       </footer>
     </div>
@@ -1832,10 +2311,18 @@ function afterRenderMotion() {
   }
 }
 
-function queueFor(el: Element | null): Track[] {
+function queueKeyFor(el: Element | null): string {
   const root = el?.closest("[data-queue]") as HTMLElement | null;
-  const key = root?.dataset.queue;
+  return root?.dataset.queue || "";
+}
+
+function queueFor(el: Element | null): Track[] {
+  const key = queueKeyFor(el);
   return key ? queueFromKey(key) : state.queue.length ? state.queue : state.current ? [state.current] : [];
+}
+
+function queueKindFor(key: string): null | "search" {
+  return key === "search" ? "search" : null;
 }
 
 function bindEvents() {
@@ -1856,13 +2343,26 @@ function bindChromeEvents() {
   document.querySelector("#btn-prev")?.addEventListener("click", () => skip(-1));
   document.querySelector("#btn-next")?.addEventListener("click", () => skip(1));
   document.querySelector("#btn-mode-bar")?.addEventListener("click", () => cyclePlayMode());
+  document.querySelector("#btn-sleep")?.addEventListener("click", () => openSleepTimerDialog());
   document.querySelector("#btn-fav-np")?.addEventListener("click", () => {
     if (state.current) void toggleFavorite(state.current);
   });
   document.querySelector("#btn-close-lyrics")?.addEventListener("click", () => toggleLyrics(false));
   document.querySelector("#toggle-lyrics-2")?.addEventListener("click", () => toggleLyrics());
-  document.querySelector("#btn-desktop-lyrics")?.addEventListener("click", () => {
-    void toggleDesktopLyrics();
+  document.querySelector("#btn-lyric-font-down")?.addEventListener("click", () => cycleLyricFont(-1));
+  document.querySelector("#btn-lyric-font-up")?.addEventListener("click", () => cycleLyricFont(1));
+  document.querySelector("#btn-lyric-offset-down")?.addEventListener("click", () => nudgeLyricOffset(-0.5));
+  document.querySelector("#btn-lyric-offset-up")?.addEventListener("click", () => nudgeLyricOffset(0.5));
+  document.querySelectorAll<HTMLElement>("[data-lyric-idx]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const idx = Number(el.dataset.lyricIdx);
+      const line = state.lyrics[idx];
+      if (!line) return;
+      lyricsUserScrollUntil = 0;
+      lastLyricScrollIdx = -1;
+      seekTo(line.time);
+      syncLyricsHighlight({ forceScroll: true });
+    });
   });
 
   const playerNow = document.querySelector("#toggle-lyrics");
@@ -1881,10 +2381,9 @@ function bindChromeEvents() {
 
   const seek = document.querySelector<HTMLInputElement>("#seek");
   seek?.addEventListener("input", () => {
-    audio.currentTime = Number(seek.value);
-    state.position = audio.currentTime;
     lyricsUserScrollUntil = 0;
     lastLyricScrollIdx = -1;
+    seekTo(Number(seek.value));
     syncLyricsHighlight({ forceScroll: true });
   });
 
@@ -1902,9 +2401,16 @@ function bindChromeEvents() {
 function bindMainEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-lib-pane]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      state.libraryPane = btn.dataset.libPane as "favorites" | "playlists";
+      state.libraryPane = btn.dataset.libPane as "favorites" | "recent" | "playlists";
       renderMain();
     });
+  });
+  document.querySelector("#btn-clear-recent")?.addEventListener("click", () => {
+    state.recent = [];
+    state.recentPage = 1;
+    persistRecent([]);
+    toast("已清空最近播放");
+    renderMain();
   });
 
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
@@ -1999,6 +2505,30 @@ function bindMainEvents() {
         openAddToPlaylistDialog(el.dataset.addPlUid!);
         return;
       }
+      if (target.closest("[data-pl-remove-uid]")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const el = target.closest("[data-pl-remove-uid]") as HTMLElement;
+        const playlistId = el.dataset.plId || "";
+        const trackUid = el.dataset.plRemoveUid || "";
+        if (playlistId && trackUid) void removeTrackFromPlaylist(playlistId, trackUid);
+        return;
+      }
+      if (target.closest("[data-pl-move]")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const el = target.closest("[data-pl-move]") as HTMLElement;
+        if (el.classList.contains("is-disabled") || el.getAttribute("aria-disabled") === "true") {
+          return;
+        }
+        const playlistId = el.dataset.plId || "";
+        const fromIndex = Number(el.dataset.plIndex);
+        const dir = el.dataset.plMove;
+        if (!playlistId || !Number.isFinite(fromIndex) || (dir !== "up" && dir !== "down")) return;
+        const toIndex = dir === "up" ? fromIndex - 1 : fromIndex + 1;
+        void movePlaylistTrack(playlistId, fromIndex, toIndex);
+        return;
+      }
       if (target.closest("[data-dl-uid]")) {
         e.preventDefault();
         e.stopPropagation();
@@ -2009,11 +2539,13 @@ function bindMainEvents() {
       }
       const uid = row.dataset.playUid!;
       const track = findTrack(uid);
-      if (track) void playTrack(track, queueFor(row));
+      if (track) {
+        const key = queueKeyFor(row);
+        void playTrack(track, queueFor(row), queueKindFor(key));
+      }
     });
     row.addEventListener("contextmenu", (e) => {
-      const root = row.closest("[data-queue]") as HTMLElement | null;
-      openTrackContextMenu(e, row.dataset.playUid!, root?.dataset.queue || "");
+      openTrackContextMenu(e, row.dataset.playUid!, queueKeyFor(row));
     });
   });
 
@@ -2025,6 +2557,19 @@ function bindMainEvents() {
   });
 
   document.querySelector("#btn-new-playlist")?.addEventListener("click", () => openNewPlaylistDialog());
+  document.querySelector("#btn-export-library")?.addEventListener("click", () => {
+    void exportLibraryBackup();
+  });
+  document.querySelector("#btn-import-library")?.addEventListener("click", () => {
+    void pickLibraryImport();
+  });
+  document.querySelectorAll<HTMLElement>("[data-rename-playlist]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.renamePlaylist!;
+      const name = state.library?.playlists.find((p) => p.id === id)?.name || "歌单";
+      openRenamePlaylistDialog(id, name);
+    });
+  });
   document.querySelectorAll<HTMLElement>("[data-del-playlist]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.dataset.delPlaylist!;
@@ -2088,13 +2633,22 @@ function bindOverlayEvents() {
         return;
       }
       if (action === "play") {
-        void playTrack(track, queueFromKey(menu.queueKey));
+        void playTrack(track, queueFromKey(menu.queueKey), queueKindFor(menu.queueKey));
         render();
         return;
       }
       if (action === "add-pl") {
         render();
         openAddToPlaylistDialog(track.uid);
+        return;
+      }
+      if (action === "remove-pl") {
+        const playlistId = menu.queueKey.startsWith("pl-") ? menu.queueKey.slice(3) : "";
+        if (playlistId) {
+          void removeTrackFromPlaylist(playlistId, track.uid);
+          return;
+        }
+        render();
         return;
       }
       if (action === "fav") {
@@ -2120,8 +2674,12 @@ function bindOverlayEvents() {
     if (!d) return;
     if (d.kind === "new-playlist") {
       void submitNewPlaylist(dialogInput?.value || "");
+    } else if (d.kind === "rename-playlist") {
+      void submitRenamePlaylist(d.id, dialogInput?.value || "");
     } else if (d.kind === "delete-playlist") {
       void confirmDeletePlaylist(d.id);
+    } else if (d.kind === "import-library") {
+      void confirmImportLibrary(d.path);
     }
   });
   document.querySelectorAll<HTMLElement>("[data-pick-playlist]").forEach((btn) => {
@@ -2138,8 +2696,29 @@ function bindOverlayEvents() {
       void applyDownloadDirPreset(path);
     });
   });
+  document.querySelectorAll<HTMLElement>("[data-sleep]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const v = btn.dataset.sleep || "";
+      if (v === "off") {
+        clearSleepTimer();
+        state.dialog = null;
+        render();
+        return;
+      }
+      if (v === "track") {
+        setSleepAfterTrack();
+        return;
+      }
+      const mins = Number(v);
+      if (Number.isFinite(mins) && mins > 0) setSleepMinutes(mins);
+    });
+  });
   dialogInput?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") void submitNewPlaylist(dialogInput.value);
+    const d = state.dialog;
+    if (e.key === "Enter") {
+      if (d?.kind === "rename-playlist") void submitRenamePlaylist(d.id, dialogInput.value);
+      else if (d?.kind === "new-playlist") void submitNewPlaylist(dialogInput.value);
+    }
     if (e.key === "Escape") closeDialog();
   });
   if (dialogInput) {
@@ -2155,11 +2734,13 @@ let lyricsUserScrollUntil = 0;
 
 function activeLyricIndex(position: number): number {
   if (!state.lyrics.length) return -1;
+  // Positive offset = lyrics feel late → compare against an earlier clock.
+  const t = position - state.lyricOffset;
   for (let i = 0; i < state.lyrics.length; i++) {
     const next = state.lyrics[i + 1];
-    if (position >= state.lyrics[i].time && (!next || position < next.time)) return i;
+    if (t >= state.lyrics[i].time && (!next || t < next.time)) return i;
   }
-  if (position < state.lyrics[0].time) return -1;
+  if (t < state.lyrics[0].time) return -1;
   return state.lyrics.length - 1;
 }
 
@@ -2187,7 +2768,7 @@ function syncLyricsHighlight(opts?: { forceScroll?: boolean }) {
   if (!lyrics || !state.lyrics.length) return;
   bindLyricsScrollGuard(lyrics);
 
-  const lines = lyrics.querySelectorAll(":scope > div");
+  const lines = lyrics.querySelectorAll(":scope > .lyric-line");
   const activeIdx = activeLyricIndex(state.position);
   state.lyrics.forEach((_, idx) => {
     lines[idx]?.classList.toggle("active-line", idx === activeIdx);
@@ -2228,11 +2809,17 @@ function patchPlayerChrome() {
   syncLyricsHighlight();
 }
 
+let lastOsPosAt = 0;
+
 audio.addEventListener("timeupdate", () => {
   state.position = audio.currentTime;
   state.duration = audio.duration || 0;
   patchPlayerChrome();
-  void syncDesktopLyrics(false);
+  const now = Date.now();
+  if (now - lastOsPosAt > 2000) {
+    lastOsPosAt = now;
+    syncOsMediaPosition(state.position, state.duration);
+  }
 });
 
 function bouncePlayButton() {
@@ -2248,6 +2835,8 @@ audio.addEventListener("play", () => {
   const btn = document.querySelector("#btn-pp");
   if (btn) btn.textContent = "⏸";
   bouncePlayButton();
+  syncOsMediaPlaybackState(true);
+  pushOsMediaTrack();
 });
 
 audio.addEventListener("pause", () => {
@@ -2255,9 +2844,17 @@ audio.addEventListener("pause", () => {
   const btn = document.querySelector("#btn-pp");
   if (btn) btn.textContent = "▶";
   bouncePlayButton();
+  syncOsMediaPlaybackState(false);
 });
 
 audio.addEventListener("ended", () => {
+  if (state.sleep?.mode === "track") {
+    clearSleepTimer(true);
+    state.playing = false;
+    syncOsMediaPlaybackState(false);
+    toast("本曲结束，已按定时停止");
+    return;
+  }
   if (state.playMode === "single") {
     audio.currentTime = 0;
     void audio.play().catch(() => undefined);

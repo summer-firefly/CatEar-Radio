@@ -1,8 +1,5 @@
 import { defineConfig } from "vite";
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
@@ -27,11 +24,5 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
-    rollupOptions: {
-      input: {
-        main: resolve(__dirname, "index.html"),
-        "desktop-lyrics": resolve(__dirname, "desktop-lyrics.html"),
-      },
-    },
   },
 });
