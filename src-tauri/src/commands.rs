@@ -345,6 +345,36 @@ pub fn add_to_playlist(
 }
 
 #[tauri::command]
+pub fn rename_playlist(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    state.library.rename_playlist(&id, &name)
+}
+
+#[tauri::command]
+pub fn remove_from_playlist(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    track_uid: String,
+) -> Result<(), String> {
+    state.library.remove_from_playlist(&playlist_id, &track_uid)
+}
+
+#[tauri::command]
+pub fn move_playlist_track(
+    state: State<'_, AppState>,
+    playlist_id: String,
+    from_index: usize,
+    to_index: usize,
+) -> Result<(), String> {
+    state
+        .library
+        .move_playlist_track(&playlist_id, from_index, to_index)
+}
+
+#[tauri::command]
 pub fn export_library(state: State<'_, AppState>) -> Result<String, String> {
     state.library.export_json()
 }
@@ -352,6 +382,31 @@ pub fn export_library(state: State<'_, AppState>) -> Result<String, String> {
 #[tauri::command]
 pub fn import_library(state: State<'_, AppState>, json: String) -> Result<(), String> {
     state.library.import_json(&json)
+}
+
+#[tauri::command]
+pub fn export_library_to_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    state.library.export_to_path(std::path::Path::new(&path))
+}
+
+#[tauri::command]
+pub fn import_library_from_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    state.library.import_from_path(std::path::Path::new(&path))
+}
+
+/// Android-friendly export into the resolved download directory.
+#[tauri::command]
+pub fn export_library_to_download_dir(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let settings = state.settings.get();
+    let dir = resolve_download_dir(&app, &settings);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录：{e}"))?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let path = dir.join(format!("maoer-library-{stamp}.json"));
+    state.library.export_to_path(&path)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]

@@ -101,6 +101,63 @@ impl LibraryStore {
         Ok(())
     }
 
+    pub fn rename_playlist(&self, id: &str, name: &str) -> Result<(), String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("请输入歌单名称".into());
+        }
+        let mut data = self.data.lock();
+        let playlist = data
+            .playlists
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| "歌单不存在".to_string())?;
+        playlist.name = trimmed.to_string();
+        self.persist(&data);
+        Ok(())
+    }
+
+    pub fn remove_from_playlist(&self, playlist_id: &str, track_uid: &str) -> Result<(), String> {
+        let mut data = self.data.lock();
+        let playlist = data
+            .playlists
+            .iter_mut()
+            .find(|p| p.id == playlist_id)
+            .ok_or_else(|| "歌单不存在".to_string())?;
+        let before = playlist.tracks.len();
+        playlist.tracks.retain(|t| t.uid != track_uid);
+        if playlist.tracks.len() == before {
+            return Err("歌单中没有这首歌".into());
+        }
+        self.persist(&data);
+        Ok(())
+    }
+
+    pub fn move_playlist_track(
+        &self,
+        playlist_id: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<(), String> {
+        let mut data = self.data.lock();
+        let playlist = data
+            .playlists
+            .iter_mut()
+            .find(|p| p.id == playlist_id)
+            .ok_or_else(|| "歌单不存在".to_string())?;
+        let len = playlist.tracks.len();
+        if from_index >= len || to_index >= len {
+            return Err("歌曲位置无效".into());
+        }
+        if from_index == to_index {
+            return Ok(());
+        }
+        let track = playlist.tracks.remove(from_index);
+        playlist.tracks.insert(to_index, track);
+        self.persist(&data);
+        Ok(())
+    }
+
     pub fn export_json(&self) -> Result<String, String> {
         let data = self.data.lock().clone();
         serde_json::to_string_pretty(&data).map_err(|e| e.to_string())
@@ -113,5 +170,18 @@ impl LibraryStore {
         *data = imported;
         self.persist(&data);
         Ok(())
+    }
+
+    pub fn export_to_path(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = self.export_json()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("无法创建目录：{e}"))?;
+        }
+        fs::write(path, json).map_err(|e| format!("写入失败：{e}"))
+    }
+
+    pub fn import_from_path(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = fs::read_to_string(path).map_err(|e| format!("读取失败：{e}"))?;
+        self.import_json(&json)
     }
 }
