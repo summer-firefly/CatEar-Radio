@@ -157,6 +157,8 @@ const state = {
   searchLoadedMaxPage: 0,
   /** Whether the active play queue comes from search results. */
   queueKind: null as null | "search",
+  /** Search result groups expanded to show the same song on other sources. */
+  searchGroupOpen: new Set<string>(),
   recommend: null as RecommendCatalog | null,
   recommendLoading: false,
   settings: {
@@ -424,6 +426,7 @@ function clearSearchResults() {
   state.searchLoadedMaxPage = 0;
   state.page = 1;
   state.searchHasMore = false;
+  state.searchGroupOpen.clear();
 }
 
 function mergeSearchAccum(tracks: Track[]) {
@@ -864,6 +867,7 @@ async function fetchSearchPage(page: number, isNewSearch: boolean) {
     if (isNewSearch) {
       state.searchAccum = [];
       state.searchLoadedMaxPage = 0;
+      state.searchGroupOpen.clear();
     }
     mergeSearchAccum(tracks);
     state.searchLoadedMaxPage = Math.max(state.searchLoadedMaxPage, page);
@@ -1674,7 +1678,7 @@ function storedToTrack(s: LibrarySnapshot["favorites"][number]): Track {
   };
 }
 
-function trackRow(track: Track, index: number, queueKey = "", listLen = 0) {
+function trackRow(track: Track, index: number, queueKey = "", listLen = 0, altCount = 0, groupKey = "") {
   const active = state.current?.uid === track.uid;
   const idx = String(index + 1).padStart(2, "0");
   const dlBusy = state.downloadingUid === track.uid;
@@ -1685,6 +1689,12 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0) {
         <span class="fav-btn${index >= listLen - 1 ? " is-disabled" : ""}" data-pl-move="down" data-pl-id="${escapeAttr(playlistId)}" data-pl-index="${index}" title="下移" role="button" aria-disabled="${index >= listLen - 1}">↓</span>
         <span class="fav-btn" data-pl-remove-uid="${escapeAttr(track.uid)}" data-pl-id="${escapeAttr(playlistId)}" title="从歌单移除" role="button">✕</span>`
     : `<span class="fav-btn" data-add-pl-uid="${escapeAttr(track.uid)}" title="加入歌单" role="button">＋</span>`;
+  const sourceBadge =
+    altCount > 0
+      ? `<span class="badge badge-multi" data-group-toggle="${escapeAttr(groupKey)}" title="展开其他音源版本" role="button">${escapeHtml(
+          SOURCE_LABEL[track.source] || track.source,
+        )} +${altCount}${state.searchGroupOpen.has(groupKey) ? " −" : ""}</span>`
+      : `<span class="badge">${escapeHtml(SOURCE_LABEL[track.source] || track.source)}</span>`;
   return `
     <button class="track-row ${active ? "active" : ""}" type="button" data-play-uid="${escapeAttr(track.uid)}">
       <span class="idx">${active && state.playing ? "♪" : idx}</span>
@@ -1694,7 +1704,7 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0) {
         <div class="sub">${escapeHtml(track.album || "单曲")}</div>
       </div>
       <div class="artist-col">${escapeHtml(track.artist || "未知歌手")}</div>
-      <span class="badge">${escapeHtml(SOURCE_LABEL[track.source] || track.source)}</span>
+      ${sourceBadge}
       <div class="row-actions">
         ${plActions}
         <span class="fav-btn" data-dl-uid="${escapeAttr(track.uid)}" title="下载" role="button">${dlBusy ? "…" : "⬇"}</span>
@@ -1704,14 +1714,75 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0) {
   `;
 }
 
-function trackList(tracks: Track[], queueKey: string, startIndex = 0): string {
+/** Case/punctuation-insensitive key used to spot the same song across sources. */
+function songKey(track: Track): string {
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[（(【\[].*?[）)】\]]/g, "")
+      .replace(/[\s\-_·・,.，。!！?？'"“”‘’]/g, "");
+  return `${norm(track.title)}|${norm(track.artist)}`;
+}
+
+interface TrackGroup {
+  key: string;
+  primary: Track;
+  alternates: Track[];
+}
+
+/** Collapse same title+artist hits from different sources into one group. */
+function groupTracks(tracks: Track[]): TrackGroup[] {
+  const order: TrackGroup[] = [];
+  const byKey = new Map<string, TrackGroup>();
+  for (const track of tracks) {
+    const key = songKey(track);
+    const found = byKey.get(key);
+    if (found) {
+      if (found.primary.uid !== track.uid && !found.alternates.some((t) => t.uid === track.uid)) {
+        found.alternates.push(track);
+      }
+      continue;
+    }
+    const group: TrackGroup = { key, primary: track, alternates: [] };
+    byKey.set(key, group);
+    order.push(group);
+  }
+  return order;
+}
+
+function trackList(
+  tracks: Track[],
+  queueKey: string,
+  startIndex = 0,
+  group = false,
+): string {
   if (!tracks.length) return emptyState("♪", "暂无歌曲", "换个关键词或稍后再试");
+  const rows = group
+    ? groupTracks(tracks)
+        .map((g, i) => {
+          const open = state.searchGroupOpen.has(g.key);
+          const primary = trackRow(
+            g.primary,
+            startIndex + i,
+            queueKey,
+            0,
+            g.alternates.length,
+            g.key,
+          );
+          if (!open || !g.alternates.length) return primary;
+          const alts = g.alternates
+            .map((t) => trackRow(t, startIndex + i, queueKey).replace("track-row", "track-row alt-row"))
+            .join("");
+          return primary + alts;
+        })
+        .join("")
+    : tracks.map((t, i) => trackRow(t, startIndex + i, queueKey, startIndex + tracks.length)).join("");
   return `
     <div class="track-list" data-queue="${escapeAttr(queueKey)}">
       <div class="track-list-head">
         <span>#</span><span></span><span>歌曲</span><span class="col-artist">歌手</span><span>来源</span><span></span>
       </div>
-      ${tracks.map((t, i) => trackRow(t, startIndex + i, queueKey, startIndex + tracks.length)).join("")}
+      ${rows}
     </div>
   `;
 }
@@ -1764,7 +1835,7 @@ function renderDiscover(): string {
         </div>
         ${
           state.searchTracks.length
-            ? trackList(state.searchTracks, "search")
+            ? trackList(state.searchTracks, "search", 0, true)
             : state.searching
               ? emptyState("…", "搜索中", "正在向各音源查询")
               : emptyState("⌕", "没有找到结果", "换个关键词，或检查音源是否可用")
@@ -2507,6 +2578,16 @@ function bindMainEvents() {
         return;
       }
       const target = e.target as HTMLElement;
+      if (target.closest("[data-group-toggle]")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const el = target.closest("[data-group-toggle]") as HTMLElement;
+        const key = el.dataset.groupToggle || "";
+        if (state.searchGroupOpen.has(key)) state.searchGroupOpen.delete(key);
+        else state.searchGroupOpen.add(key);
+        renderMain();
+        return;
+      }
       if (target.closest("[data-fav-uid]")) {
         e.preventDefault();
         e.stopPropagation();

@@ -1068,6 +1068,29 @@ button {
   justify-self: start;
 }
 
+.badge-multi {
+  cursor: pointer;
+  color: var(--accent);
+  border-color: rgba(107, 182, 255, 0.55);
+  background: rgba(107, 182, 255, 0.2);
+}
+
+.badge-multi:hover {
+  background: rgba(107, 182, 255, 0.32);
+}
+
+.track-row.alt-row {
+  background: rgba(107, 182, 255, 0.05);
+  padding-top: 4px;
+  padding-bottom: 4px;
+  animation: rec-item-in 0.2s var(--ease-out);
+}
+
+.track-row.alt-row .idx,
+.track-row.alt-row .title {
+  opacity: 0.8;
+}
+
 .row-actions {
   display: flex;
   align-items: center;
