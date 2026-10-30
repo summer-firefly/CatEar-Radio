@@ -72,67 +72,68 @@ impl KuwoMusicSource {
             self.base_url,
             urlencoding::encode(&track.keyword)
         );
-        let body = get_text(&url).await?;
-        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&body) else {
-            return Ok(track);
-        };
-        let Some(Value::Object(d)) = root.get("data") else {
-            return Ok(track);
-        };
 
-        let audio_url = d
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .or(track.audio_url.clone());
-        let quality_text = format!("{} {}", str_field(d, "level"), str_field(d, "format")).to_lowercase();
-        let (quality, quality_label) =
-            if RegexLike::lossless(&quality_text) {
-                (Some("lossless".into()), Some("LOSSLESS".into()))
-            } else {
-                infer_quality_from_url(audio_url.as_deref())
-            };
+        let mut out = track;
+        if let Ok(body) = get_text(&url).await {
+            if let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&body) {
+                if let Some(Value::Object(d)) = root.get("data") {
+                    let audio_url = d
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .or(out.audio_url.clone());
+                    let quality_text =
+                        format!("{} {}", str_field(d, "level"), str_field(d, "format")).to_lowercase();
+                    let (quality, quality_label) = if RegexLike::lossless(&quality_text) {
+                        (Some("lossless".into()), Some("LOSSLESS".into()))
+                    } else {
+                        infer_quality_from_url(audio_url.as_deref())
+                    };
 
-        let song_id = opt_str(d, "rid").unwrap_or(track.song_id.clone());
-        // oiapi detail JSON has no lyric fields; pull from Kuwo open API by musicId.
-        let mut lrc = first_str(d, &["lyric", "lrc", "lyrics"]).or(track.lrc.clone());
-        if lrc.as_deref().unwrap_or("").is_empty() {
-            if let Some(music_id) = kuwo_music_id(d, &song_id) {
-                lrc = fetch_kuwo_lrc(&music_id).await;
+                    let song_id = opt_str(d, "rid").unwrap_or(out.song_id.clone());
+                    let lrc = first_str(d, &["lyric", "lrc", "lyrics"]).or(out.lrc.clone());
+                    out = Track {
+                        title: opt_str(d, "song").unwrap_or(out.title),
+                        artist: opt_str(d, "singer").unwrap_or(out.artist),
+                        album: opt_str(d, "album").unwrap_or(out.album),
+                        cover: opt_str(d, "picture").or(out.cover),
+                        song_id,
+                        audio_url,
+                        lrc,
+                        lrc_url: None,
+                        quality,
+                        quality_label,
+                        ..out
+                    };
+                }
             }
         }
 
-        Ok(Track {
-            title: opt_str(d, "song").unwrap_or(track.title),
-            artist: opt_str(d, "singer").unwrap_or(track.artist),
-            album: opt_str(d, "album").unwrap_or(track.album),
-            cover: opt_str(d, "picture").or(track.cover),
-            song_id,
-            audio_url,
-            lrc,
-            lrc_url: None,
-            details_loaded: true,
-            quality,
-            quality_label,
-            ..track
-        })
+        // oiapi detail often has no lyrics; always try Kuwo open API by musicId.
+        if out.lrc.as_deref().unwrap_or("").is_empty() {
+            if let Some(music_id) = normalize_kuwo_music_id(&out.song_id) {
+                if let Some(lrc) = fetch_kuwo_lrc(&music_id).await {
+                    out.lrc = Some(lrc);
+                }
+            }
+        }
+
+        out.details_loaded = true;
+        Ok(out)
     }
 }
 
-fn kuwo_music_id(d: &Map<String, Value>, song_id: &str) -> Option<String> {
-    if let Some(id) = d.get("id") {
-        if let Some(n) = id.as_u64() {
-            return Some(n.to_string());
-        }
-        if let Some(s) = id.as_str().filter(|s| !s.is_empty()) {
-            return Some(s.trim_start_matches("MUSIC_").to_string());
-        }
-    }
-    let rid = song_id.trim();
+fn normalize_kuwo_music_id(song_id: &str) -> Option<String> {
+    let rid = song_id
+        .trim()
+        .trim_start_matches("MUSIC_")
+        .trim_start_matches("music_")
+        .trim();
     if rid.is_empty() {
-        return None;
+        None
+    } else {
+        Some(rid.to_string())
     }
-    Some(rid.trim_start_matches("MUSIC_").to_string())
 }
 
 async fn fetch_kuwo_lrc(music_id: &str) -> Option<String> {
