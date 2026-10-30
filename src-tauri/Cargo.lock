@@ -2061,6 +2061,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tauri-plugin-media-session",
  "tauri-plugin-opener",
  "tokio",
  "urlencoding",
@@ -3827,6 +3828,17 @@ dependencies = [
  "thiserror 2.0.21",
  "toml 1.1.8+spec-1.1.0",
  "url",
+]
+
+[[package]]
+name = "tauri-plugin-media-session"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0c8a8691d65110989d7ec433690242ecf1762ad35fa6fd7aa7f5d2699d8d05"
+dependencies = [
+ "serde",
+ "tauri",
+ "tauri-plugin",
 ]
 
 [[package]]

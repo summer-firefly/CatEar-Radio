@@ -2451,6 +2451,72 @@
           "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-initialize`\n- `allow-update-state`\n- `allow-update-timeline`\n- `allow-clear`\n- `allow-register-listener`",
+          "type": "string",
+          "const": "media-session:default",
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-initialize`\n- `allow-update-state`\n- `allow-update-timeline`\n- `allow-clear`\n- `allow-register-listener`"
+        },
+        {
+          "description": "Enables the clear command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:allow-clear",
+          "markdownDescription": "Enables the clear command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the initialize command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:allow-initialize",
+          "markdownDescription": "Enables the initialize command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:allow-register-listener",
+          "markdownDescription": "Enables the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:allow-update-state",
+          "markdownDescription": "Enables the update_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_timeline command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:allow-update-timeline",
+          "markdownDescription": "Enables the update_timeline command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:deny-clear",
+          "markdownDescription": "Denies the clear command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the initialize command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:deny-initialize",
+          "markdownDescription": "Denies the initialize command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:deny-register-listener",
+          "markdownDescription": "Denies the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:deny-update-state",
+          "markdownDescription": "Denies the update_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_timeline command without any pre-configured scope.",
+          "type": "string",
+          "const": "media-session:deny-update-timeline",
+          "markdownDescription": "Denies the update_timeline command without any pre-configured scope."
+        },
+        {
           "description": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`",
           "type": "string",
           "const": "opener:default",
