@@ -1,6 +1,6 @@
 [package]
 name = "maoer_radio"
-version = "0.1.0"
+version = "0.2.0"
 description = "猫耳收音机 — 跨平台多音源音乐播放器"
 authors = ["maoer"]
 edition = "2021"
