@@ -2392,7 +2392,8 @@ textarea.import-box {
   }
 
   .page-scroll {
-    padding: 2px 12px 16px;
+    /* Extra bottom room so the last row can scroll clear of the dock fade. */
+    padding: 2px 12px 24px;
   }
 
   .page-title {
@@ -2447,11 +2448,25 @@ textarea.import-box {
   }
 
   .player-dock {
+    position: relative;
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-rows: auto auto auto;
     gap: 2px 8px;
     padding: 6px 10px 4px;
     align-items: center;
+    box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.34);
+  }
+
+  /* Fade the scrolled page into the dock instead of slicing it at the edge. */
+  .player-dock::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 100%;
+    height: 18px;
+    pointer-events: none;
+    background: linear-gradient(to top, rgba(10, 18, 36, 0.88), rgba(10, 18, 36, 0));
   }
 
   .player-dock > .player-now {
