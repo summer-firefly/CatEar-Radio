@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
 
-use crate::model::{MusicSourceId, Track};
+use crate::model::{MusicSourceId, SearchPageResult, SourceSearchError, Track};
 use crate::source::MusicSources;
 
 pub struct MusicRepository {
@@ -17,10 +17,6 @@ impl MusicRepository {
         }
     }
 
-    pub fn cached(&self, uid: &str) -> Option<Track> {
-        self.cache.lock().get(uid).cloned()
-    }
-
     pub async fn search(
         &self,
         sources: &MusicSources,
@@ -29,7 +25,7 @@ impl MusicRepository {
         limit_per_source: u32,
         page: u32,
         reset: bool,
-    ) -> Result<Vec<Track>, String> {
+    ) -> Result<SearchPageResult, String> {
         let trimmed = keyword.trim();
         if trimmed.is_empty() {
             return Err("请输入关键词".into());
@@ -53,18 +49,27 @@ impl MusicRepository {
             let keyword = trimmed.to_string();
             let sources = sources.clone();
             set.spawn(async move {
-                sources
-                    .search(source, &keyword, limit_per_source, page)
-                    .await
-                    .unwrap_or_default()
+                match sources.search(source, &keyword, limit_per_source, page).await {
+                    Ok(tracks) => (source, Ok(tracks)),
+                    Err(message) => (source, Err(message)),
+                }
             });
         }
 
+        let mut errors = Vec::new();
         while let Some(joined) = set.join_next().await {
-            if let Ok(tracks) = joined {
-                let mut cache = self.cache.lock();
-                for track in tracks {
-                    cache.entry(track.uid.clone()).or_insert(track);
+            match joined {
+                Ok((_source, Ok(tracks))) => {
+                    let mut cache = self.cache.lock();
+                    for track in tracks {
+                        cache.entry(track.uid.clone()).or_insert(track);
+                    }
+                }
+                Ok((source, Err(message))) => {
+                    errors.push(SourceSearchError { source, message });
+                }
+                Err(e) => {
+                    eprintln!("search task join error: {e}");
                 }
             }
         }
@@ -80,14 +85,20 @@ impl MusicRepository {
             list.sort_by_key(|t| t.display_index);
         }
 
-        Ok(interleave(&grouped))
+        Ok(SearchPageResult {
+            tracks: interleave(&grouped),
+            errors,
+        })
     }
 
     pub async fn ensure_playable(&self, sources: &MusicSources, track: Track) -> Track {
         {
             let cache = self.cache.lock();
             if let Some(cached) = cache.get(&track.uid) {
-                if cached.details_loaded && !cached.audio_url.as_deref().unwrap_or("").is_empty() {
+                let has_audio = !cached.audio_url.as_deref().unwrap_or("").is_empty();
+                let has_lrc = !cached.lrc.as_deref().unwrap_or("").is_empty();
+                // Re-fetch when lyrics are still missing — local playback used to skip this.
+                if cached.details_loaded && has_audio && has_lrc {
                     return cached.clone();
                 }
             }
@@ -106,7 +117,11 @@ impl MusicRepository {
 }
 
 fn interleave(grouped: &HashMap<MusicSourceId, Vec<Track>>) -> Vec<Track> {
-    let order = [MusicSourceId::Netease, MusicSourceId::Qq, MusicSourceId::Kuwo];
+    let order = [
+        MusicSourceId::Netease,
+        MusicSourceId::Qq,
+        MusicSourceId::Kuwo,
+    ];
     let mut indices: HashMap<MusicSourceId, usize> = order.iter().map(|s| (*s, 0)).collect();
     let mut out = Vec::new();
     let mut added = true;

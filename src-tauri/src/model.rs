@@ -266,6 +266,21 @@ pub struct SourceInfo {
     pub label: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSearchError {
+    pub source: MusicSourceId,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPageResult {
+    pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub errors: Vec<SourceSearchError>,
+}
+
 pub fn infer_quality_from_url(url: Option<&str>) -> (Option<String>, Option<String>) {
     let Some(url) = url else {
         return (None, None);

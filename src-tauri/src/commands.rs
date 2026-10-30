@@ -4,7 +4,8 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::model::{
-    AppSettings, LibrarySnapshot, RecommendCatalog, SourceInfo, StoredPlaylist, Track,
+    AppSettings, LibrarySnapshot, RecommendCatalog, SearchPageResult, SourceInfo, StoredPlaylist,
+    Track,
 };
 use crate::paths::{
     default_download_dir, download_dir_presets, resolve_download_dir, resolve_sources_dir,
@@ -238,7 +239,7 @@ pub async fn search_tracks(
     page: Option<u32>,
     reset: Option<bool>,
     limit_per_source: Option<u32>,
-) -> Result<Vec<Track>, String> {
+) -> Result<SearchPageResult, String> {
     let settings = state.settings.get();
     let (_, sources) = load_sources(&app, &settings);
     let limit = limit_per_source
@@ -266,12 +267,10 @@ pub async fn ensure_playable(
     let settings = state.settings.get();
     let dir = resolve_download_dir(&app, &settings);
 
-    // Local download wins over network / cache audio URL.
+    let (_, sources) = load_sources(&app, &settings);
+    // Always resolve details (lyrics etc.); local file only overrides the audio URL.
+    let mut out = state.music.ensure_playable(&sources, track.clone()).await;
     if let Some(local) = find_local_audio(&dir, &track) {
-        let mut out = state
-            .music
-            .cached(&track.uid)
-            .unwrap_or_else(|| track.clone());
         out.title = if out.title.trim().is_empty() {
             track.title.clone()
         } else {
@@ -287,11 +286,8 @@ pub async fn ensure_playable(
         out.details_loaded = true;
         out.quality = Some("local".into());
         out.quality_label = Some("本地".into());
-        return Ok(out);
     }
-
-    let (_, sources) = load_sources(&app, &settings);
-    Ok(state.music.ensure_playable(&sources, track).await)
+    Ok(out)
 }
 
 /// Returns locally cached recommendations only (filled by background sync).
