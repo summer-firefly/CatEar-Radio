@@ -92,6 +92,7 @@ pub fn run() {
             commands::get_default_download_dir,
             commands::list_download_dir_presets,
             commands::download_track,
+            commands::scan_local_tracks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

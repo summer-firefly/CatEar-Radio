@@ -50,6 +50,7 @@ const SOURCE_LABEL: Record<string, string> = {
   netease: "网易云",
   qq: "QQ",
   kuwo: "酷我",
+  local: "本地",
 };
 
 const QUALITY_OPTIONS: Array<{ id: string; label: string }> = [
@@ -283,8 +284,12 @@ const state = {
   downloadProgress: {} as Record<string, { downloaded: number; total: number }>,
   sources: [] as SourceInfo[],
   library: null as LibrarySnapshot | null,
-  libraryPane: "favorites" as "favorites" | "recent" | "playlists",
+  libraryPane: "favorites" as "favorites" | "recent" | "playlists" | "local",
   recent: loadRecent(),
+  /** Local audio files found by the last folder scan. */
+  localTracks: [] as Track[],
+  localScanDir: "",
+  localScanning: false,
   queue: [] as Track[],
   queueIndex: -1,
   current: null as Track | null,
@@ -1639,9 +1644,25 @@ async function listenDownloadProgress() {
     );
   } catch (e) {
     console.error(e);
+  }
+}
+
+/** Scan the download folder (or a custom dir) for playable audio files. */
+async function scanLocalTracks(dir?: string) {
+  if (state.localScanning) return;
+  state.localScanning = true;
+  renderMain();
+  try {
+    const target = (dir ?? state.settings.downloadDir).trim();
+    const tracks = await invoke<Track[]>("scan_local_tracks", { dir: target || null });
+    state.localTracks = tracks;
+    state.localScanDir = target || state.defaultDownloadDir;
+    toast(tracks.length ? `找到 ${tracks.length} 首本地歌曲` : "该目录下没有音频文件");
+  } catch (e) {
+    toast(`扫描失败：${String(e)}`);
   } finally {
-    state.downloadingUid = "";
-    render();
+    state.localScanning = false;
+    renderMain();
   }
 }
 
@@ -1805,6 +1826,7 @@ function queueFromKey(key: string): Track[] {
   if (key === "hot") return state.recommend?.hotTracks ?? [];
   if (key === "fav") return (state.library?.favorites ?? []).map(storedToTrack);
   if (key === "recent") return state.recent.slice();
+  if (key === "local") return state.localTracks.slice();
   if (key === "browse") {
     return browsingPlaylist()?.tracks.slice() ?? [];
   }
@@ -1941,8 +1963,12 @@ function renderContextMenu(): string {
           : ""
       }
       <button type="button" class="ctx-item" data-ctx="fav" role="menuitem">${fav ? "取消收藏" : "收藏"}</button>
-      <div class="ctx-sep"></div>
-      <button type="button" class="ctx-item" data-ctx="download" role="menuitem">下载</button>
+      ${
+        track.source === "local"
+          ? ""
+          : `<div class="ctx-sep"></div>
+      <button type="button" class="ctx-item" data-ctx="download" role="menuitem">下载</button>`
+      }
     </div>`;
 }
 
@@ -2150,6 +2176,7 @@ function findTrack(uid: string): Track | undefined {
     state.searchTracks.find((t) => t.uid === uid) ||
     state.searchAccum.find((t) => t.uid === uid) ||
     state.recent.find((t) => t.uid === uid) ||
+    state.localTracks.find((t) => t.uid === uid) ||
     state.recommend?.hotTracks.find((t) => t.uid === uid) ||
     state.recommend?.hotPlaylists.flatMap((p) => p.tracks).find((t) => t.uid === uid) ||
     state.library?.favorites.map(storedToTrack).find((t) => t.uid === uid) ||
@@ -2219,7 +2246,11 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0, altCo
       ${sourceBadge}
       <div class="row-actions">
         ${plActions}
-        <span class="fav-btn${dlBusy ? " is-downloading" : ""}" data-dl-uid="${escapeAttr(track.uid)}" title="下载" role="button">${downloadBadgeText(track.uid)}</span>
+        ${
+          track.source === "local"
+            ? ""
+            : `<span class="fav-btn${dlBusy ? " is-downloading" : ""}" data-dl-uid="${escapeAttr(track.uid)}" title="下载" role="button">${downloadBadgeText(track.uid)}</span>`
+        }
         ${favButton(track.uid)}
       </div>
     </button>
@@ -2464,6 +2495,9 @@ function renderLibrary(): string {
           <button type="button" class="lib-tab ${pane === "playlists" ? "active" : ""}" data-lib-pane="playlists" role="tab" aria-selected="${pane === "playlists"}">
             歌单 · ${playlists.length}
           </button>
+          <button type="button" class="lib-tab ${pane === "local" ? "active" : ""}" data-lib-pane="local" role="tab" aria-selected="${pane === "local"}">
+            本地 · ${state.localTracks.length}
+          </button>
         </div>
         <div class="lib-pane-actions">
           <button class="btn ghost sm" id="btn-export-library" type="button">导出备份</button>
@@ -2512,7 +2546,31 @@ function renderLibrary(): string {
                     : emptyState("◷", "还没有播放记录", "听几首歌后，最近播放会出现在这里")
                 }
               </section>`
-            : `<section class="lib-pane">
+            : pane === "local"
+              ? `<section class="lib-pane">
+                  <div class="lib-pane-actions">
+                    <button class="btn ghost sm" id="btn-scan-local" type="button" ${state.localScanning ? "disabled" : ""}>
+                      ${state.localScanning ? "扫描中…" : "扫描目录"}
+                    </button>
+                    ${
+                      state.localScanDir
+                        ? `<span class="hint">${escapeHtml(state.localScanDir)}</span>`
+                        : ""
+                    }
+                  </div>
+                  ${
+                    state.localTracks.length
+                      ? trackList(state.localTracks, "local")
+                      : emptyState(
+                          "♫",
+                          state.localScanning ? "正在扫描…" : "还没有本地歌曲",
+                          state.localScanDir
+                            ? "该目录下未找到音频文件"
+                            : "扫描下载目录，或把音频放进下载目录后再试",
+                        )
+                  }
+                </section>`
+              : `<section class="lib-pane">
               <div class="lib-pane-actions">
                 <button class="btn ghost sm" id="btn-new-playlist" type="button">新建歌单</button>
               </div>
@@ -3044,10 +3102,15 @@ function bindChromeEvents() {
 function bindMainEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-lib-pane]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      state.libraryPane = btn.dataset.libPane as "favorites" | "recent" | "playlists";
+      state.libraryPane = btn.dataset.libPane as
+        | "favorites"
+        | "recent"
+        | "playlists"
+        | "local";
       renderMain();
     });
   });
+  document.querySelector("#btn-scan-local")?.addEventListener("click", () => void scanLocalTracks());
   document.querySelector("#btn-clear-recent")?.addEventListener("click", () => {
     state.recent = [];
     state.recentPage = 1;

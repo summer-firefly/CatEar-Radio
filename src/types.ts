@@ -1,4 +1,4 @@
-export type MusicSourceId = "netease" | "qq" | "kuwo";
+export type MusicSourceId = "netease" | "qq" | "kuwo" | "local";
 
 export interface SourceSearchError {
   source: MusicSourceId;

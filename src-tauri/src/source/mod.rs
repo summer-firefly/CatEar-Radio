@@ -53,6 +53,8 @@ impl MusicSources {
             }
             MusicSourceId::Qq => QqMusicSource::new(base).search(keyword, limit, page).await,
             MusicSourceId::Kuwo => KuwoMusicSource::new(base).search(keyword, limit, page).await,
+            // Local tracks come from the filesystem scan, not a network source.
+            MusicSourceId::Local => Err("本地音源不支持网络搜索".into()),
         }
     }
 
@@ -69,7 +71,8 @@ impl MusicSources {
                     .await
             }
             MusicSourceId::Qq => QqMusicSource::new(base).fetch_details(track, quality).await,
-            MusicSourceId::Kuwo => KuwoMusicSource::new(base).fetch_details(track, quality).await
+            MusicSourceId::Kuwo => KuwoMusicSource::new(base).fetch_details(track, quality).await,
+            MusicSourceId::Local => Ok(track),
         }
     }
 }

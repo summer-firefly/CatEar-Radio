@@ -6,6 +6,8 @@ pub enum MusicSourceId {
     Netease,
     Qq,
     Kuwo,
+    /// Local files on disk. Never registered as a network source.
+    Local,
 }
 
 impl MusicSourceId {
@@ -14,6 +16,7 @@ impl MusicSourceId {
             Self::Netease => "netease",
             Self::Qq => "qq",
             Self::Kuwo => "kuwo",
+            Self::Local => "local",
         }
     }
 
@@ -22,6 +25,7 @@ impl MusicSourceId {
             Self::Netease => "网易云",
             Self::Qq => "QQ",
             Self::Kuwo => "酷我",
+            Self::Local => "本地",
         }
     }
 
@@ -34,10 +38,12 @@ impl MusicSourceId {
             "netease" | "网易云" => Some(Self::Netease),
             "qq" => Some(Self::Qq),
             "kuwo" | "酷我" => Some(Self::Kuwo),
+            "local" | "本地" => Some(Self::Local),
             _ => None,
         }
     }
 
+    /// Network sources only — `Local` has no manifest and cannot be searched.
     pub fn all() -> &'static [Self] {
         &[Self::Netease, Self::Qq, Self::Kuwo]
     }

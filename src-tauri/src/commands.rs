@@ -264,6 +264,22 @@ pub async fn ensure_playable(
     state: State<'_, AppState>,
     track: Track,
 ) -> Result<Track, String> {
+    // Scanning puts the absolute path in the uid, so local playback still works
+    // after favourites / recent / session restores dropped the audio URL.
+    if track.source == crate::model::MusicSourceId::Local {
+        let mut local = track;
+        local.audio_url = local
+            .uid
+            .strip_prefix("local:")
+            .map(Path::new)
+            .filter(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned());
+        local.details_loaded = true;
+        local.quality = Some("local".into());
+        local.quality_label = Some("本地".into());
+        return Ok(local);
+    }
+
     let settings = state.settings.get();
     let dir = resolve_download_dir(&app, &settings);
     let quality = crate::model::AudioQuality::from_id(&settings.quality);
@@ -542,4 +558,107 @@ pub async fn download_track(
         path: path.to_string_lossy().into_owned(),
         already_exists: false,
     })
+}
+
+/// Walk `dir` (bounded depth) collecting playable audio files.
+fn collect_audio_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 || out.len() >= 5000 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_audio_files(&path, depth - 1, out);
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if AUDIO_EXTS.contains(&ext.as_str()) {
+            out.push(path);
+        }
+    }
+}
+
+/// `歌手 - 歌名.mp3` → (artist, title); plain filenames become the title.
+fn parse_file_stem(stem: &str) -> (String, String) {
+    if let Some((artist, title)) = stem.split_once(" - ") {
+        let artist = artist.trim();
+        let title = title.trim();
+        if !artist.is_empty() && !title.is_empty() {
+            return (artist.to_string(), title.to_string());
+        }
+    }
+    (String::new(), stem.trim().to_string())
+}
+
+/// Scan a folder (defaults to the download dir) for local audio files.
+#[tauri::command]
+pub fn scan_local_tracks(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dir: Option<String>,
+) -> Result<Vec<Track>, String> {
+    let settings = state.settings.get();
+    let root = match dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => resolve_download_dir(&app, &settings),
+    };
+    if !root.is_dir() {
+        return Err(format!("目录不存在：{}", root.to_string_lossy()));
+    }
+
+    let mut files = Vec::new();
+    collect_audio_files(&root, 4, &mut files);
+    files.sort();
+
+    let tracks = files
+        .into_iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("未命名")
+                .to_string();
+            let (artist, title) = parse_file_stem(&stem);
+            // Sub-folder name doubles as the album; files at the root show "本地文件".
+            let album = path
+                .parent()
+                .filter(|p| *p != root.as_path())
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "本地文件".into());
+            Track {
+                // Path-derived uid keeps local tracks stable across scans.
+                uid: format!("local:{}", path.to_string_lossy()),
+                source: crate::model::MusicSourceId::Local,
+                display_index: 1,
+                keyword: stem.clone(),
+                song_id: String::new(),
+                song_mid: String::new(),
+                qq_id: String::new(),
+                qq_search_key: String::new(),
+                qq_index: 0,
+                title,
+                artist,
+                album,
+                cover: None,
+                audio_url: Some(path.to_string_lossy().into_owned()),
+                lrc: None,
+                lrc_url: None,
+                details_loaded: true,
+                quality: Some("local".into()),
+                quality_label: Some("本地".into()),
+                pay: None,
+            }
+        })
+        .collect();
+
+    Ok(tracks)
 }
