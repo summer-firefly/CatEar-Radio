@@ -117,24 +117,29 @@ function loadRecent(): Track[] {
   }
 }
 
+/** Trim a track down to the fields needed to restore playback later. */
+function compactTrack(t: Track): Track {
+  return {
+    uid: t.uid,
+    source: t.source,
+    displayIndex: t.displayIndex,
+    keyword: t.keyword,
+    songId: t.songId,
+    songMid: t.songMid,
+    qqId: t.qqId,
+    qqSearchKey: t.qqSearchKey,
+    qqIndex: t.qqIndex,
+    title: t.title,
+    artist: t.artist,
+    album: t.album,
+    cover: t.cover ?? null,
+    detailsLoaded: false,
+  };
+}
+
 function persistRecent(tracks: Track[]) {
   try {
-    const compact = tracks.slice(0, RECENT_MAX).map((t) => ({
-      uid: t.uid,
-      source: t.source,
-      title: t.title,
-      artist: t.artist,
-      album: t.album,
-      cover: t.cover ?? null,
-      songId: t.songId,
-      songMid: t.songMid,
-      qqId: t.qqId,
-      qqSearchKey: t.qqSearchKey,
-      qqIndex: t.qqIndex,
-      keyword: t.keyword,
-      displayIndex: t.displayIndex,
-    }));
-    localStorage.setItem(RECENT_KEY, JSON.stringify(compact));
+    localStorage.setItem(RECENT_KEY, JSON.stringify(tracks.slice(0, RECENT_MAX).map(compactTrack)));
   } catch {
     /* ignore quota */
   }
@@ -144,6 +149,81 @@ function pushRecent(track: Track) {
   const next = [track, ...state.recent.filter((t) => t.uid !== track.uid)].slice(0, RECENT_MAX);
   state.recent = next;
   persistRecent(next);
+}
+
+const SESSION_KEY = "maoer-session";
+const SESSION_QUEUE_MAX = 300;
+
+interface StoredSession {
+  queue: Track[];
+  queueIndex: number;
+  queueKind: null | "search";
+  playMode: PlayMode;
+  position: number;
+  duration: number;
+}
+
+function loadSession(): StoredSession | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredSession> | null;
+    if (!parsed || !Array.isArray(parsed.queue) || !parsed.queue.length) return null;
+    const queue = parsed.queue
+      .filter((x): x is Track => !!x && typeof x === "object" && typeof (x as Track).uid === "string")
+      .map((x) => compactTrack(x))
+      .slice(0, SESSION_QUEUE_MAX);
+    if (!queue.length) return null;
+    const index = Math.min(Math.max(0, Number(parsed.queueIndex) || 0), queue.length - 1);
+    const mode = parsed.playMode === "single" || parsed.playMode === "shuffle" ? parsed.playMode : "list";
+    return {
+      queue,
+      queueIndex: index,
+      queueKind: parsed.queueKind === "search" ? "search" : null,
+      playMode: mode,
+      position: Math.max(0, Number(parsed.position) || 0),
+      duration: Math.max(0, Number(parsed.duration) || 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+let sessionWriteTimer = 0;
+
+function persistSession() {
+  // Throttle instead of debounce — timeupdate fires continuously while playing.
+  if (sessionWriteTimer) return;
+  sessionWriteTimer = window.setTimeout(writeSessionNow, 2000);
+}
+
+function writeSessionNow() {
+  if (sessionWriteTimer) {
+    window.clearTimeout(sessionWriteTimer);
+    sessionWriteTimer = 0;
+  }
+  const current = state.current;
+  if (!current || !state.queue.length) {
+    try {
+      localStorage.removeItem(SESSION_KEY);
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  try {
+    const payload: StoredSession = {
+      queue: state.queue.slice(0, SESSION_QUEUE_MAX).map(compactTrack),
+      queueIndex: Math.max(0, state.queueIndex),
+      queueKind: state.queueKind,
+      playMode: state.playMode,
+      position: state.position,
+      duration: state.duration || audio.duration || 0,
+    };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
+  } catch {
+    /* ignore quota */
+  }
 }
 
 const state = {
@@ -222,6 +302,8 @@ const state = {
   downloadDirPresets: [] as DownloadDirPreset[],
   /** Custom track context menu (native WebView menu only has Reload). */
   contextMenu: null as null | { x: number; y: number; trackUid: string; queueKey: string },
+  /** Play queue drawer (bottom-right sheet). */
+  queueOpen: false,
 };
 
 /** Suppress duplicate recommend-updated paints right after a user refresh. */
@@ -258,6 +340,8 @@ function clearSearchHistory() {
 }
 
 let playGeneration = 0;
+/** Saved position for a restored track — applied only when that exact track is loaded. */
+let pendingResume: { uid: string; seconds: number } | null = null;
 let lastMotionTab: TabId | "" = "";
 let lastMotionTrackUid = "";
 let lastMotionLyricsOpen: boolean | null = null;
@@ -339,6 +423,64 @@ function toggleMute() {
     audio.volume = 0;
     paintMuteButton();
   }
+}
+
+/** True when focus sits in a text field or an overlay owns the keyboard. */
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  return el.isContentEditable;
+}
+
+function handleShortcut(e: KeyboardEvent) {
+  if (e.defaultPrevented || e.isComposing) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (state.dialog || state.contextMenu) return;
+  if (isTypingTarget(e.target)) return;
+
+  switch (e.key) {
+    case " ":
+      // Let a focused button/row handle its own Space activation.
+      if ((e.target as HTMLElement | null)?.closest?.("button, [role='button']")) return;
+      if (!state.current) return;
+      e.preventDefault();
+      playPause();
+      break;
+    case "ArrowLeft":
+      e.preventDefault();
+      nudgeSeek(-5);
+      break;
+    case "ArrowRight":
+      e.preventDefault();
+      nudgeSeek(5);
+      break;
+    case "ArrowUp":
+      e.preventDefault();
+      applyVolume(state.volume + 0.05);
+      toast(`音量 ${Math.round(state.volume * 100)}%`);
+      break;
+    case "ArrowDown":
+      e.preventDefault();
+      applyVolume(state.volume - 0.05);
+      toast(`音量 ${Math.round(state.volume * 100)}%`);
+      break;
+    case "m":
+    case "M":
+      e.preventDefault();
+      toggleMute();
+      break;
+    default:
+      break;
+  }
+}
+
+function nudgeSeek(delta: number) {
+  const dur = audio.duration || state.duration || 0;
+  if (!dur) return;
+  seekTo(state.position + delta);
+  syncLyricsHighlight({ forceScroll: true });
 }
 
 /** How many track rows fit in the main scroll area. */
@@ -682,7 +824,17 @@ async function boot() {
     e.preventDefault();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && state.contextMenu) closeContextMenu();
+    if (e.key === "Escape") {
+      if (state.contextMenu) {
+        closeContextMenu();
+        return;
+      }
+      if (state.queueOpen) {
+        toggleQueueDrawer(false);
+        return;
+      }
+    }
+    handleShortcut(e);
   });
   void initOsMediaControls({
     play: () => {
@@ -721,6 +873,8 @@ async function boot() {
   } catch (e) {
     console.error(e);
   }
+  restoreSession();
+  window.addEventListener("pagehide", () => writeSessionNow());
   render();
   void refreshRecommend(false);
   void listenRecommendUpdates();
@@ -943,6 +1097,7 @@ async function extendSearchQueueIfNeeded(): Promise<boolean> {
     state.queueIndex = currentUid
       ? state.queue.findIndex((t) => t.uid === currentUid)
       : state.queueIndex;
+    resetShuffleOrder();
     return state.queueIndex >= 0 && state.queueIndex + 1 < state.queue.length;
   } catch (e) {
     toast(`加载下一页失败：${String(e)}`);
@@ -962,6 +1117,38 @@ async function goSearchPage(delta: number) {
   await fetchSearchPage(next, false);
 }
 
+/** Seek after metadata loads so the browser clamps to the real duration. */
+function applyResumePosition(seconds: number) {
+  const apply = () => {
+    try {
+      audio.currentTime = Math.max(0, seconds);
+    } catch {
+      /* ignore */
+    }
+    state.position = audio.currentTime || 0;
+    patchPlayerChrome();
+    syncOsMediaPosition(state.position, state.duration);
+  };
+  if (audio.readyState >= 1) apply();
+  else audio.addEventListener("loadedmetadata", apply, { once: true });
+}
+
+/** Rebuild the play queue from the last session — paused, not auto-playing. */
+function restoreSession() {
+  const saved = loadSession();
+  if (!saved) return;
+  state.queue = saved.queue;
+  state.queueIndex = saved.queueIndex;
+  state.queueKind = saved.queueKind;
+  state.playMode = saved.playMode;
+  const track = saved.queue[saved.queueIndex];
+  if (!track) return;
+  state.current = track;
+  state.position = saved.position;
+  state.duration = saved.duration;
+  pendingResume = saved.position > 0 ? { uid: track.uid, seconds: saved.position } : null;
+}
+
 async function playTrack(track: Track, queue?: Track[], queueKind: null | "search" = null) {
   const gen = ++playGeneration;
 
@@ -969,14 +1156,18 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
     state.queue = queue;
     state.queueIndex = queue.findIndex((t) => t.uid === track.uid);
     state.queueKind = queueKind;
+    resetShuffleOrder();
   } else if (state.queueIndex < 0 || state.queue[state.queueIndex]?.uid !== track.uid) {
     state.queue = [track];
     state.queueIndex = 0;
     state.queueKind = queueKind;
+    resetShuffleOrder();
   }
 
   state.preparing = true;
   state.current = track;
+  state.position = 0;
+  state.duration = 0;
   render();
 
   try {
@@ -994,6 +1185,10 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
     lastLyricScrollIdx = -1;
     lyricsUserScrollUntil = 0;
     audio.src = toPlayableSrc(preferHttps(detailed.audioUrl));
+    if (pendingResume && pendingResume.uid === detailed.uid) {
+      applyResumePosition(pendingResume.seconds);
+    }
+    pendingResume = null;
     await audio.play();
     if (gen !== playGeneration) return;
     state.playing = true;
@@ -1001,6 +1196,7 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
     state.position = audio.currentTime || 0;
     pushRecent(detailed);
     pushOsMediaTrack();
+    persistSession();
   } catch (e) {
     if (gen !== playGeneration || isAbortError(e)) return;
     toast(`播放失败：${String(e)}`);
@@ -1020,6 +1216,10 @@ function playPause() {
   if (state.playing) {
     audio.pause();
     state.playing = false;
+  } else if (!audio.getAttribute("src")) {
+    // Restored session: audio has no source yet, load it and jump to the saved spot.
+    pendingResume = state.position > 0 ? { uid: state.current.uid, seconds: state.position } : null;
+    void playTrack(state.current, state.queue, state.queueKind);
   } else {
     void audio.play().then(
       () => {
@@ -1037,10 +1237,57 @@ function skip(delta: number) {
   void skipAsync(delta);
 }
 
+/** Shuffled permutation of queue indices — every track plays once per cycle. */
+let shuffleOrder: number[] = [];
+let shuffleCursor = -1;
+
+function buildShuffleOrder(startIndex: number) {
+  const order = Array.from({ length: state.queue.length }, (_, i) => i);
+  for (let i = order.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const at = order.indexOf(startIndex);
+  if (at > 0) {
+    order.splice(at, 1);
+    order.unshift(startIndex);
+  }
+  shuffleOrder = order;
+  shuffleCursor = 0;
+}
+
+function resetShuffleOrder() {
+  shuffleOrder = [];
+  shuffleCursor = -1;
+}
+
+/** Next/previous index in shuffle mode without repeating until the cycle wraps. */
+function shuffleStep(delta: number): number {
+  const len = state.queue.length;
+  if (len <= 1) return state.queueIndex;
+  if (shuffleOrder.length !== len || shuffleCursor < 0) buildShuffleOrder(state.queueIndex);
+
+  if (delta > 0) {
+    shuffleCursor += 1;
+    if (shuffleCursor >= shuffleOrder.length) {
+      // Cycle finished — reshuffle so the next round differs.
+      buildShuffleOrder(state.queueIndex);
+      shuffleCursor = shuffleOrder.length > 1 ? 1 : 0;
+    }
+  } else {
+    shuffleCursor -= 1;
+    if (shuffleCursor < 0) {
+      shuffleCursor = shuffleOrder.length - 1;
+    }
+  }
+  return shuffleOrder[shuffleCursor] ?? state.queueIndex;
+}
+
 async function skipAsync(delta: number) {
   if (!state.queue.length) return;
   if (state.playMode === "shuffle") {
-    const next = Math.floor(Math.random() * state.queue.length);
+    const next = shuffleStep(delta);
+    if (next === state.queueIndex) return;
     state.queueIndex = next;
     void playTrack(state.queue[next], state.queue, state.queueKind);
     return;
@@ -1072,6 +1319,8 @@ function cyclePlayMode() {
   const order: PlayMode[] = ["list", "single", "shuffle"];
   const i = order.indexOf(state.playMode);
   state.playMode = order[(i + 1) % order.length];
+  resetShuffleOrder();
+  persistSession();
   const modeBtn = document.querySelector("#btn-mode-bar");
   if (modeBtn) {
     modeBtn.textContent = modeLabelShort();
@@ -1471,6 +1720,106 @@ function queueFromKey(key: string): Track[] {
     return (pl?.tracks ?? []).map((t) => storedToTrack(t as LibrarySnapshot["favorites"][number]));
   }
   return state.queue.length ? state.queue : state.current ? [state.current] : [];
+}
+
+function renderQueueDrawer(): string {
+  if (!state.queueOpen) return "";
+  const tracks = state.queue;
+  const rows = tracks.length
+    ? tracks
+        .map((t, i) => {
+          const active = i === state.queueIndex;
+          return `
+          <div class="queue-row${active ? " active" : ""}" data-queue-jump="${i}" role="button" tabindex="0">
+            <span class="idx">${active ? "♪" : String(i + 1).padStart(2, "0")}</span>
+            <img class="cover" src="${escapeAttr(coverUrl(t))}" alt="" loading="lazy" />
+            <div class="meta">
+              <div class="title">${escapeHtml(t.title || "未知歌曲")}</div>
+              <div class="sub">${escapeHtml(t.artist || "未知歌手")}</div>
+            </div>
+            <button class="queue-remove" type="button" data-queue-remove="${escapeAttr(t.uid)}" title="移出队列">✕</button>
+          </div>`;
+        })
+        .join("")
+    : emptyState("♪", "播放队列是空的", "从列表里选一首歌开始");
+
+  return `
+    <div class="queue-backdrop" id="queue-backdrop"></div>
+    <section class="queue-drawer" id="queue-drawer" role="dialog" aria-label="播放队列">
+      <div class="queue-head">
+        <h3>播放队列<span class="queue-count">${tracks.length} 首</span></h3>
+        <div class="queue-head-actions">
+          <button class="btn ghost sm" id="btn-queue-clear" type="button" ${tracks.length ? "" : "disabled"}>清空</button>
+          <button class="icon-btn" id="btn-queue-close" type="button" title="关闭">✕</button>
+        </div>
+      </div>
+      <div class="queue-list">${rows}</div>
+    </section>`;
+}
+
+function toggleQueueDrawer(force?: boolean) {
+  const next = force ?? !state.queueOpen;
+  if (next === state.queueOpen) return;
+  state.queueOpen = next;
+  syncQueueDrawer();
+}
+
+/** Re-render only the drawer node so the player and lyrics keep their DOM. */
+function syncQueueDrawer() {
+  const holder = document.querySelector("#queue-root");
+  if (!holder) {
+    render();
+    return;
+  }
+  holder.innerHTML = renderQueueDrawer();
+  bindQueueEvents();
+}
+
+function playQueueIndex(index: number) {
+  const track = state.queue[index];
+  if (!track) return;
+  state.queueIndex = index;
+  void playTrack(track, state.queue, state.queueKind);
+  syncQueueDrawer();
+}
+
+function removeQueueTrack(uid: string) {
+  const index = state.queue.findIndex((t) => t.uid === uid);
+  if (index < 0) return;
+  const wasCurrent = index === state.queueIndex;
+  state.queue = state.queue.filter((t) => t.uid !== uid);
+  if (!state.queue.length) {
+    state.queueIndex = -1;
+    audio.pause();
+    state.playing = false;
+    state.current = null;
+    state.position = 0;
+    state.duration = 0;
+    writeSessionNow();
+    syncQueueDrawer();
+    render();
+    return;
+  }
+  if (wasCurrent) {
+    state.queueIndex = Math.min(index, state.queue.length - 1);
+    void playTrack(state.queue[state.queueIndex], state.queue, state.queueKind);
+  } else if (index < state.queueIndex) {
+    state.queueIndex -= 1;
+  }
+  resetShuffleOrder();
+  persistSession();
+  syncQueueDrawer();
+}
+
+function clearQueue() {
+  if (!state.queue.length) return;
+  const current = state.current;
+  state.queue = current ? [current] : [];
+  state.queueIndex = current ? 0 : -1;
+  resetShuffleOrder();
+  persistSession();
+  toast("已清空播放队列");
+  syncQueueDrawer();
 }
 
 function renderContextMenu(): string {
@@ -2367,6 +2716,9 @@ function render() {
             />
           </div>
           <button class="mode-btn" id="btn-mode-bar" type="button" title="${modeLabel()}">${modeLabelShort()}</button>
+          <button class="mode-btn${state.queueOpen ? " is-active" : ""}" id="btn-queue" type="button" title="播放队列">队列${
+            state.queue.length ? ` · ${state.queue.length}` : ""
+          }</button>
           <button class="mode-btn${state.sleep ? " is-active" : ""}" id="btn-sleep" type="button" title="${
             state.sleep ? "定时关闭中 · 点击调整" : "定时关闭"
           }">${sleepLabel()}</button>
@@ -2376,6 +2728,7 @@ function render() {
     </div>
     ${renderDialog()}
     ${renderContextMenu()}
+    <div id="queue-root">${renderQueueDrawer()}</div>
     <div class="toast ${state.toast ? "" : "hidden"}">${escapeHtml(state.toast)}</div>
   `;
 
@@ -2482,6 +2835,44 @@ function bindEvents() {
   bindChromeEvents();
   bindMainEvents();
   bindOverlayEvents();
+  bindQueueEvents();
+}
+
+function patchQueueBtn() {
+  const btn = document.querySelector("#btn-queue");
+  if (!btn) return;
+  btn.textContent = `队列${state.queue.length ? ` · ${state.queue.length}` : ""}`;
+  btn.classList.toggle("is-active", state.queueOpen);
+}
+
+function bindQueueEvents() {
+  document.querySelector("#queue-backdrop")?.addEventListener("click", () => toggleQueueDrawer(false));
+  document.querySelector("#btn-queue-close")?.addEventListener("click", () => toggleQueueDrawer(false));
+  document.querySelector("#btn-queue-clear")?.addEventListener("click", () => clearQueue());
+  document.querySelectorAll<HTMLElement>("[data-queue-jump]").forEach((row) => {
+    const jump = () => {
+      const idx = Number(row.dataset.queueJump);
+      if (Number.isFinite(idx)) playQueueIndex(idx);
+    };
+    row.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest("[data-queue-remove]")) return;
+      jump();
+    });
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        jump();
+      }
+    });
+  });
+  document.querySelectorAll<HTMLElement>("[data-queue-remove]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const uid = btn.dataset.queueRemove;
+      if (uid) removeQueueTrack(uid);
+    });
+  });
+  patchQueueBtn();
 }
 
 function bindChromeEvents() {
@@ -2496,6 +2887,7 @@ function bindChromeEvents() {
   document.querySelector("#btn-prev")?.addEventListener("click", () => skip(-1));
   document.querySelector("#btn-next")?.addEventListener("click", () => skip(1));
   document.querySelector("#btn-mode-bar")?.addEventListener("click", () => cyclePlayMode());
+  document.querySelector("#btn-queue")?.addEventListener("click", () => toggleQueueDrawer());
   document.querySelector("#btn-sleep")?.addEventListener("click", () => openSleepTimerDialog());
   document.querySelector("#btn-fav-np")?.addEventListener("click", () => {
     if (state.current) void toggleFavorite(state.current);
@@ -2981,6 +3373,7 @@ audio.addEventListener("timeupdate", () => {
   state.position = audio.currentTime;
   state.duration = audio.duration || 0;
   patchPlayerChrome();
+  persistSession();
   const now = Date.now();
   if (now - lastOsPosAt > 2000) {
     lastOsPosAt = now;
@@ -3011,6 +3404,7 @@ audio.addEventListener("pause", () => {
   if (btn) btn.textContent = "▶";
   bouncePlayButton();
   syncOsMediaPlaybackState(false);
+  writeSessionNow();
 });
 
 audio.addEventListener("ended", () => {
