@@ -1852,7 +1852,7 @@ function renderQueueDrawer(): string {
           return `
           <div class="queue-row${active ? " active" : ""}" data-queue-jump="${i}" role="button" tabindex="0">
             <span class="idx">${active ? "♪" : String(i + 1).padStart(2, "0")}</span>
-            <img class="cover" src="${escapeAttr(coverUrl(t))}" alt="" loading="lazy" />
+            <img class="cover" src="${coverPlaceholder()}"${coverAttrs(t)} alt="" loading="lazy" decoding="async" />
             <div class="meta">
               <div class="title">${escapeHtml(t.title || "未知歌曲")}</div>
               <div class="sub">${escapeHtml(t.artist || "未知歌手")}</div>
@@ -1893,6 +1893,7 @@ function syncQueueDrawer() {
   }
   holder.innerHTML = renderQueueDrawer();
   bindQueueEvents();
+  hydrateCovers();
 }
 
 function playQueueIndex(index: number) {
@@ -2145,18 +2146,122 @@ function renderDialog(): string {
     </div>`;
 }
 
-function coverUrl(track?: Track | null): string {
-  const raw = track?.cover?.trim();
-  if (raw) {
-    // QQ CDN often returns http://; WKWebView blocks mixed-content images.
-    return preferHttps(raw);
-  }
+/** Inline SVG placeholder shown until the real cover arrives. */
+function coverPlaceholder(): string {
   return (
     "data:image/svg+xml," +
     encodeURIComponent(
       `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#1b2340"/><stop offset="1" stop-color="#3d8bfd" stop-opacity=".35"/></linearGradient></defs><rect fill="url(#g)" width="120" height="120"/><text x="60" y="68" text-anchor="middle" fill="#a1a6d0" font-size="34">♪</text></svg>`,
     )
   );
+}
+
+/**
+ * `<img>` attributes that defer the real bitmap to {@link hydrateCovers}.
+ * Covers route through the Rust cache, so a re-render costs a map lookup
+ * instead of a fresh CDN round-trip.
+ */
+function coverAttrs(track: Track | null | undefined, variant: "thumb" | "full" = "thumb"): string {
+  const raw = track?.cover?.trim();
+  if (!raw) return "";
+  return ` data-cover="${escapeAttr(preferHttps(raw))}" data-cover-variant="${variant}"`;
+}
+
+/** url|variant → data URL, so paging back and forth never re-invokes Rust. */
+const coverMemCache = new Map<string, string>();
+const coverInflight = new Map<string, Promise<string | null>>();
+const COVER_CONCURRENCY = 4;
+let coverActive = 0;
+const coverWaiters: Array<() => void> = [];
+
+async function acquireCoverSlot(): Promise<void> {
+  if (coverActive < COVER_CONCURRENCY) {
+    coverActive += 1;
+    return;
+  }
+  // Park until a running request hands its slot over; the releaser increments
+  // on our behalf so the count can never drift above the limit.
+  await new Promise<void>((resolve) => coverWaiters.push(resolve));
+}
+
+function releaseCoverSlot() {
+  const next = coverWaiters.shift();
+  if (next) {
+    next();
+  } else {
+    coverActive -= 1;
+  }
+}
+
+async function loadCover(url: string, variant: string): Promise<string | null> {
+  const key = `${variant}|${url}`;
+  const cached = coverMemCache.get(key);
+  if (cached) return cached;
+  const running = coverInflight.get(key);
+  if (running) return running;
+
+  await acquireCoverSlot();
+
+  const task = (async () => {
+    try {
+      const data = await invoke<string>("fetch_cover", { url, variant });
+      coverMemCache.set(key, data);
+      return data;
+    } catch {
+      return null;
+    } finally {
+      coverInflight.delete(key);
+      releaseCoverSlot();
+    }
+  })();
+  coverInflight.set(key, task);
+  return task;
+}
+
+let coverObserver: IntersectionObserver | null = null;
+
+function fillCover(img: HTMLImageElement) {
+  const url = img.dataset.cover;
+  if (!url) return;
+  const variant = img.dataset.coverVariant === "full" ? "full" : "thumb";
+  // Already in memory: paint synchronously so paging back does not flicker.
+  const hit = coverMemCache.get(`${variant}|${url}`);
+  if (hit) {
+    img.src = hit;
+    img.classList.add("cover-loaded");
+    return;
+  }
+  void loadCover(url, variant).then((data) => {
+    // The element may have been replaced by a newer render in the meantime.
+    if (!data || !img.isConnected || img.dataset.cover !== url) return;
+    img.src = data;
+    img.classList.add("cover-loaded");
+  });
+}
+
+/** Start loading covers that are (or are about to be) on screen. */
+function hydrateCovers() {
+  const imgs = Array.from(document.querySelectorAll<HTMLImageElement>("img[data-cover]"));
+  if (!imgs.length) return;
+  if (typeof IntersectionObserver !== "function") {
+    imgs.forEach(fillCover);
+    return;
+  }
+  coverObserver ??= new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        coverObserver?.unobserve(entry.target);
+        fillCover(entry.target as HTMLImageElement);
+      }
+    },
+    { rootMargin: "300px 0px" },
+  );
+  for (const img of imgs) {
+    if (img.dataset.coverBound) continue;
+    img.dataset.coverBound = "1";
+    coverObserver.observe(img);
+  }
 }
 
 function escapeHtml(s: string): string {
@@ -2237,7 +2342,7 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0, altCo
   return `
     <button class="track-row ${active ? "active" : ""}" type="button" data-play-uid="${escapeAttr(track.uid)}">
       <span class="idx">${active && state.playing ? "♪" : idx}</span>
-      <img class="cover" src="${escapeAttr(coverUrl(track))}" alt="" />
+      <img class="cover" src="${coverPlaceholder()}"${coverAttrs(track)} alt="" loading="lazy" decoding="async" />
       <div class="meta">
         <div class="title">${escapeHtml(track.title || "未知歌曲")}</div>
         <div class="sub">${escapeHtml(track.album || "单曲")}</div>
@@ -2412,7 +2517,7 @@ function renderDiscover(): string {
                     (p, i) => `
           <button class="playlist-card rec-item" type="button" style="--i:${i}" data-playlist-id="${escapeAttr(p.id)}">
             <div class="cover-wrap">
-              <img src="${escapeAttr(preferHttps(p.cover || "") || coverUrl(p.tracks[0]))}" alt="" />
+              <img src="${escapeAttr(coverPlaceholder())}"${coverAttrs({ cover: p.cover || p.tracks[0]?.cover } as Track)} alt="" loading="lazy" decoding="async" />
               <span class="play-badge">▶</span>
             </div>
             <div class="title">${escapeHtml(p.name)}</div>
@@ -2707,7 +2812,7 @@ function renderLyricsPanel(): string {
       <h3>${state.preparing ? "准备中…" : "歌词"}</h3>
       <button class="icon-btn" id="btn-close-lyrics" type="button" title="关闭">✕</button>
     </div>
-    <img class="cover lg" src="${escapeAttr(coverUrl(t))}" alt="" />
+    <img class="cover lg" src="${coverPlaceholder()}"${coverAttrs(t, "full")} alt="" decoding="async" />
     <h2 class="np-title">${escapeHtml(t.title)}</h2>
     <p class="np-artist">${escapeHtml(t.artist)} · ${SOURCE_LABEL[t.source] || t.source}</p>
     <div class="lp-tools" role="toolbar" aria-label="歌词设置">
@@ -2791,6 +2896,7 @@ function renderMain() {
   });
   main.innerHTML = renderMainColumnHtml();
   bindMainEvents();
+  hydrateCovers();
   afterRenderMotion();
 }
 
@@ -2829,7 +2935,7 @@ function render() {
         ${
           current
             ? `<button class="player-now" type="button" id="toggle-lyrics" title="查看歌词">
-                <img class="cover" src="${escapeAttr(coverUrl(current))}" alt="" />
+                <img class="cover" src="${coverPlaceholder()}"${coverAttrs(current, "full")} alt="" decoding="async" />
                 <div class="meta">
                   <div class="title">${escapeHtml(current.title)}</div>
                   <div class="sub">${escapeHtml(current.artist)}${state.preparing ? " · 准备中" : ""}</div>
@@ -2837,7 +2943,7 @@ function render() {
                 ${favButton(current.uid)}
               </button>`
             : `<div class="player-now">
-                <img class="cover" src="${escapeAttr(coverUrl(null))}" alt="" style="opacity:.5" />
+                <img class="cover" src="${coverPlaceholder()}" alt="" style="opacity:.5" />
                 <div class="meta"><div class="title">未在播放</div><div class="sub">从列表选一首歌</div></div>
               </div>`
         }
@@ -2889,6 +2995,7 @@ function render() {
   `;
 
   bindEvents();
+  hydrateCovers();
   afterRenderMotion();
 }
 

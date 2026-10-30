@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::library::LibraryStore;
@@ -9,4 +10,6 @@ pub struct AppState {
     pub recommend: Arc<RecommendRepository>,
     pub library: LibraryStore,
     pub settings: SettingsStore,
+    /// On-disk cover cache; keeps list scrolls from re-hitting slow CDNs.
+    pub cover_dir: PathBuf,
 }

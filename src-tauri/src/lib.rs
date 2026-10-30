@@ -1,4 +1,5 @@
 mod commands;
+mod cover;
 mod library;
 mod model;
 mod paths;
@@ -54,11 +55,15 @@ pub fn run() {
             let recommend = RecommendRepository::load(data_dir.join("recommend.json"));
             recommend.start_background_sync(app.handle().clone());
 
+            let cover_dir = data_dir.join("covers");
+            std::fs::create_dir_all(&cover_dir).ok();
+
             let state = AppState {
                 music: Arc::new(MusicRepository::new()),
                 recommend,
                 library: LibraryStore::load(data_dir.join("library.json")),
                 settings,
+                cover_dir,
             };
             app.manage(state);
             Ok(())
@@ -93,6 +98,7 @@ pub fn run() {
             commands::list_download_dir_presets,
             commands::download_track,
             commands::scan_local_tracks,
+            commands::fetch_cover,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

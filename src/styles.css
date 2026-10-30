@@ -1181,6 +1181,39 @@ button {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
+/* Covers are patched in after the list renders, so fade rather than snap. */
+img[data-cover] {
+  background-image: linear-gradient(
+    110deg,
+    rgba(255, 255, 255, 0.06) 25%,
+    rgba(255, 255, 255, 0.13) 37%,
+    rgba(255, 255, 255, 0.06) 63%
+  );
+  background-size: 300% 100%;
+  animation: cover-shimmer 1.4s linear infinite;
+}
+
+img[data-cover].cover-loaded {
+  animation: none;
+  background-image: none;
+  transition: opacity 0.25s ease;
+}
+
+@keyframes cover-shimmer {
+  from {
+    background-position: 150% 0;
+  }
+  to {
+    background-position: -50% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  img[data-cover] {
+    animation: none;
+  }
+}
+
 .meta .title {
   font-weight: 600;
   font-size: 0.9rem;

@@ -662,3 +662,76 @@ pub fn scan_local_tracks(
 
     Ok(tracks)
 }
+
+/// Fetch a cover through the on-disk cache and return it as a data URL.
+///
+/// Going through Rust means the WKWebView never sees the slow CDN directly:
+/// the second view of a list is served from the local file in a few ms.
+#[tauri::command]
+pub async fn fetch_cover(
+    state: State<'_, AppState>,
+    url: String,
+    variant: String,
+) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("缺少封面地址".into());
+    }
+    let variant = crate::cover::CoverVariant::parse(&variant);
+    // Ask the CDN for a right-sized render before caching, so a 40px row does
+    // not download an 800px JPEG.
+    let target = crate::cover::sized_cover_url(trimmed, variant);
+    let cached = crate::cover::read_cached(&state.cover_dir, &target, variant);
+    let (bytes, ext) = match cached {
+        Some(hit) => hit,
+        None => crate::cover::fetch_and_cache(&state.cover_dir, &target, variant).await?,
+    };
+    Ok(format!(
+        "data:image/{ext};base64,{}",
+        base64_encode(&bytes)
+    ))
+}
+
+const B64_TABLE: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(B64_TABLE[(n >> 18) as usize & 63] as char);
+        out.push(B64_TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64_TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+}
