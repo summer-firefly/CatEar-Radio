@@ -2510,13 +2510,21 @@ textarea.import-box {
   }
 
   .volume-row {
-    flex: 1;
+    flex: 1 1 0;
     margin-right: 0;
+    min-width: 0;
+    /* A range input keeps an intrinsic min-width, so without clipping the
+       painted track spills out of its box and runs under the mode buttons. */
+    overflow: hidden;
+  }
+
+  .volume,
+  .seek {
+    flex: 1 1 0;
     min-width: 0;
   }
 
   .volume {
-    flex: 1;
     width: auto;
     max-width: none;
   }
