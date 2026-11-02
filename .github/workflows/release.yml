@@ -75,8 +75,14 @@ jobs:
           java-version: 17
       - name: Install the Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # `tools` was dropped from the SDK, so only ask for what still exists.
+          packages: "platform-tools"
       - name: Install the NDK
-        run: sdkmanager "ndk;27.2.12479018"
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager --install "ndk;27.2.12479018"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
