@@ -42,3 +42,6 @@ src-tauri/gen/android/app/src/main/jniLibs/
 src-tauri/android-signing/
 
 src-tauri/icons/ios/
+
+# Local scratch output
+.trae-html-share-packages/
