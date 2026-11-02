@@ -106,6 +106,15 @@ export interface CacheStats {
 export type TabId = "discover" | "library" | "settings";
 export type PlayMode = "list" | "single" | "shuffle";
 
+/** Mirrors the `check_update` command result. */
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  hasUpdate: boolean;
+  url: string;
+  notes: string;
+}
+
 export interface LyricWord {
   time: number;
   /** End of this word — used to fill the karaoke highlight smoothly. */

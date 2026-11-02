@@ -9,6 +9,7 @@ mod source;
 mod state;
 mod storage;
 mod tags;
+mod update;
 
 use std::sync::Arc;
 
