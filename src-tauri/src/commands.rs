@@ -652,6 +652,8 @@ pub fn scan_local_tracks(
                 audio_url: Some(path.to_string_lossy().into_owned()),
                 lrc: None,
                 lrc_url: None,
+                lrc_translation: None,
+                lrc_words: None,
                 details_loaded: true,
                 quality: Some("local".into()),
                 quality_label: Some("本地".into()),

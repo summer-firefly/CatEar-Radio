@@ -82,6 +82,12 @@ pub struct Track {
     pub lrc: Option<String>,
     #[serde(default)]
     pub lrc_url: Option<String>,
+    /// Translated lyrics, aligned to `lrc` timestamps.
+    #[serde(default)]
+    pub lrc_translation: Option<String>,
+    /// Word-level lyrics (NetEase YRC) for karaoke highlighting.
+    #[serde(default)]
+    pub lrc_words: Option<String>,
     #[serde(default)]
     pub details_loaded: bool,
     #[serde(default)]
@@ -196,6 +202,8 @@ impl From<&StoredTrack> for Track {
             audio_url: None,
             lrc: None,
             lrc_url: None,
+            lrc_translation: None,
+            lrc_words: None,
             details_loaded: false,
             quality: t.quality.clone(),
             quality_label: t.quality_label.clone(),

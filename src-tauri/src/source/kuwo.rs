@@ -55,6 +55,8 @@ impl KuwoMusicSource {
                     audio_url: None,
                     lrc: None,
                     lrc_url: None,
+                    lrc_translation: None,
+                    lrc_words: None,
                     details_loaded: false,
                     quality: None,
                     quality_label: None,

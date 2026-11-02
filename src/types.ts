@@ -27,6 +27,10 @@ export interface Track {
   audioUrl?: string | null;
   lrc?: string | null;
   lrcUrl?: string | null;
+  /** Translated LRC (bilingual lyrics). */
+  lrcTranslation?: string | null;
+  /** Word-level lyrics in NetEase YRC form; parsed into per-word timing. */
+  lrcWords?: string | null;
   detailsLoaded: boolean;
   quality?: string | null;
   qualityLabel?: string | null;
@@ -102,7 +106,18 @@ export interface CacheStats {
 export type TabId = "discover" | "library" | "settings";
 export type PlayMode = "list" | "single" | "shuffle";
 
+export interface LyricWord {
+  time: number;
+  /** End of this word — used to fill the karaoke highlight smoothly. */
+  end: number;
+  text: string;
+}
+
 export interface LyricLine {
   time: number;
   text: string;
+  /** Translated line, shown under the original when available. */
+  translation?: string;
+  /** Word-level timing for karaoke highlighting; absent for plain LRC. */
+  words?: LyricWord[];
 }

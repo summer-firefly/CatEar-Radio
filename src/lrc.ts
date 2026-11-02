@@ -1,4 +1,4 @@
-export type LyricLine = { time: number; text: string };
+import type { LyricLine, LyricWord } from "./types";
 
 function parseTimestamp(min: string, sec: string, frac?: string): number {
   const m = Number(min) || 0;
@@ -76,6 +76,34 @@ function parseRawTimedLines(raw: string): LyricLine[] {
   return lines.sort((a, b) => a.time - b.time);
 }
 
+/**
+ * NetEase word-level rows: `[start,duration](start,dur,flag)word…`.
+ * Milliseconds, no separators between words.
+ */
+function parseWordLines(raw: string): LyricLine[] {
+  const out: LyricLine[] = [];
+  for (const row of raw.split("\n")) {
+    const line = row.trim();
+    const head = /^\[(\d+),(\d+)\](.*)$/.exec(line);
+    if (!head) continue;
+
+    const words: LyricWord[] = [];
+    let text = "";
+    for (const m of head[3].matchAll(/\((\d+),(\d+),\d+\)([^(]*)/g)) {
+      const piece = m[3];
+      if (!piece) continue;
+      const time = Number(m[1]) / 1000;
+      words.push({ time, end: time + Number(m[2]) / 1000, text: piece });
+      text += piece;
+    }
+
+    const trimmed = text.trim();
+    if (!trimmed || !words.length) continue;
+    out.push({ time: Number(head[1]) / 1000, text: trimmed, words });
+  }
+  return out.sort((a, b) => a.time - b.time);
+}
+
 /** One Chinese phrase per row; spread times across the gap to the next stamp. */
 function expandTimedPhrases(raw: LyricLine[]): LyricLine[] {
   const out: LyricLine[] = [];
@@ -101,14 +129,60 @@ function expandTimedPhrases(raw: LyricLine[]): LyricLine[] {
   return out;
 }
 
+/** Attach same-timestamp rows (translations, word timings) onto the main lines. */
+function attachTimed(
+  lines: LyricLine[],
+  source: LyricLine[],
+  tolerance: number,
+  apply: (line: LyricLine, src: LyricLine) => void,
+) {
+  let j = 0;
+  for (const line of lines) {
+    while (j < source.length && source[j].time < line.time - tolerance) j++;
+    if (j >= source.length) break;
+    if (Math.abs(source[j].time - line.time) <= tolerance) {
+      apply(line, source[j]);
+      j++;
+    }
+  }
+}
+
 /**
  * Parse LRC into timed lines.
- * Handles classic `[t]text`, multi-tag `[t1][t2]text`, and inline `[t1]a [t2]b`.
- * Chinese phrases joined by spaces become separate display lines.
+ * Handles classic `[t]text`, multi-tag `[t1][t2]text`, inline `[t1]a [t2]b`,
+ * bilingual translations, and word-level (karaoke) timings.
+ * Chinese phrases joined by spaces become separate display lines — but only when
+ * there is nothing time-aligned to them, since splitting would break the merge.
  */
-export function parseLrc(raw?: string | null): LyricLine[] {
+export function parseLrc(
+  raw?: string | null,
+  extra?: { translation?: string | null; words?: string | null },
+): LyricLine[] {
   if (!raw) return [];
-  return expandTimedPhrases(parseRawTimedLines(raw));
+  const base = parseRawTimedLines(raw);
+  if (!base.length) return [];
+
+  const translations = extra?.translation ? parseRawTimedLines(extra.translation) : [];
+  const wordLines = extra?.words ? parseWordLines(extra.words) : [];
+  if (!translations.length && !wordLines.length) return expandTimedPhrases(base);
+
+  if (translations.length) {
+    attachTimed(base, translations, 0.35, (line, src) => {
+      const text = src.text.trim();
+      // Keep rows that already carry the original as the translation slot only.
+      if (text && text !== line.text) line.translation = text;
+    });
+  }
+  if (wordLines.length) {
+    attachTimed(base, wordLines, 0.3, (line, src) => {
+      if (!src.words?.length) return;
+      line.words = src.words;
+      // Word text is the authoritative rendering — it may differ in spacing.
+      line.text = src.text;
+    });
+  }
+
+  return base;
 }
 
 export function formatTime(sec: number): string {

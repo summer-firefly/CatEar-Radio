@@ -83,9 +83,42 @@ impl NeteaseMusicSource {
             }
         }
 
+        // The meting mirror only forwards the plain LRC; translations and
+        // word-level timings live on NetEase's own endpoint.
+        if !track.song_id.is_empty() && (track.lrc_translation.is_none() || track.lrc_words.is_none())
+        {
+            let (translation, words) = fetch_lyric_extras(&track.song_id).await;
+            track.lrc_translation = track.lrc_translation.or(translation);
+            track.lrc_words = track.lrc_words.or(words);
+        }
+
         track.details_loaded = true;
         Ok(track)
     }
+}
+
+/// Best-effort bilingual / karaoke lyrics; empty results are not an error.
+async fn fetch_lyric_extras(song_id: &str) -> (Option<String>, Option<String>) {
+    let url = format!(
+        "https://music.163.com/api/song/lyric/v1?id={}&cp=false&lv=0&kv=0&tv=-1&yv=-1",
+        urlencoding::encode(song_id)
+    );
+    let Ok(body) = get_text(&url).await else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&body) else {
+        return (None, None);
+    };
+    let pick = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.get("lyric"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    (pick("tlyric"), pick("yrc"))
 }
 
 fn parse_track_list(body: &str, keyword_fallback: &str) -> Vec<Track> {
@@ -123,6 +156,8 @@ fn parse_track_list(body: &str, keyword_fallback: &str) -> Vec<Track> {
                     .get("lrc")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                lrc_translation: None,
+                lrc_words: None,
                 details_loaded: false,
                 quality: None,
                 quality_label: None,
