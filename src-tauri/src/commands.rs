@@ -554,10 +554,36 @@ pub async fn download_track(
     let path = unique_path(&dir, &stem, ext);
     stream_to_file(&app, &detailed.uid, &url, &path).await?;
 
+    // Tag the file so it shows artist/album/cover outside the app. A failure
+    // here leaves a perfectly playable file, so it never aborts the download.
+    let cover = fetch_download_cover(state.inner(), &detailed).await;
+    if let Err(e) = crate::tags::write(&path, &detailed, cover) {
+        eprintln!("write tags failed for {}: {e}", path.to_string_lossy());
+    }
+
     Ok(DownloadResult {
         path: path.to_string_lossy().into_owned(),
         already_exists: false,
     })
+}
+
+/// Cover bytes for embedding, served from (or seeded into) the on-disk cache.
+async fn fetch_download_cover(
+    state: &AppState,
+    track: &Track,
+) -> Option<(Vec<u8>, &'static str)> {
+    let url = track.cover.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+    let variant = crate::cover::CoverVariant::Full;
+    // Downloads are an explicit user action — ask the CDN for an embedded-sized
+    // render rather than reusing the 130px thumbnail. The cache key is the
+    // sized URL, matching what `fetch_cover` stores.
+    let target = crate::cover::sized_cover_url(url, variant);
+    if let Some(cached) = crate::cover::read_cached(&state.cover_dir, &target, variant) {
+        return Some(cached);
+    }
+    crate::cover::fetch_and_cache(&state.cover_dir, &target, variant)
+        .await
+        .ok()
 }
 
 /// Walk `dir` (bounded depth) collecting playable audio files.

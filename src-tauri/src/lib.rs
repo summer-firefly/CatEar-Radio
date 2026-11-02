@@ -8,6 +8,7 @@ mod settings;
 mod source;
 mod state;
 mod storage;
+mod tags;
 
 use std::sync::Arc;
 
