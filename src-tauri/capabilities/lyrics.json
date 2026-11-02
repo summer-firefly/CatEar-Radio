@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-lyrics",
+  "description": "Frameless always-on-top lyrics overlay",
+  "windows": ["desktop-lyrics"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "core:window:allow-start-dragging"
+  ]
+}
