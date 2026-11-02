@@ -20,6 +20,119 @@ use state::AppState;
 use tauri::Emitter;
 use tauri::Manager;
 
+/// Frontend listens for these and drives the existing audio element.
+const PLAYBACK_COMMAND: &str = "playback-command";
+
+fn send_playback_command(app: &tauri::AppHandle, action: &str) {
+    let _ = app.emit(PLAYBACK_COMMAND, action);
+}
+
+#[cfg(desktop)]
+fn setup_desktop(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let lyrics = MenuItem::with_id(app, "lyrics", "桌面歌词", true, None::<&str>)?;
+    let toggle = MenuItem::with_id(app, "toggle", "播放 / 暂停", true, None::<&str>)?;
+    let prev = MenuItem::with_id(app, "prev", "上一首", true, None::<&str>)?;
+    let next = MenuItem::with_id(app, "next", "下一首", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show,
+            &lyrics,
+            &PredefinedMenuItem::separator(app)?,
+            &toggle,
+            &prev,
+            &next,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
+
+    let mut builder = TrayIconBuilder::with_id("main-tray")
+        .tooltip("猫耳收音机")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => reveal_main_window(app),
+            "lyrics" => {
+                // Tray is the escape hatch for a click-through window: unlock first,
+                // then hide, then show.
+                let (visible, locked) = app
+                    .get_webview_window("desktop-lyrics")
+                    .map(|w| {
+                        (
+                            w.is_visible().unwrap_or(false),
+                            DESKTOP_LYRICS_LOCKED.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    })
+                    .unwrap_or((false, false));
+                let (next_visible, next_locked) = if !visible {
+                    (Some(true), Some(false))
+                } else if locked {
+                    (None, Some(false))
+                } else {
+                    (Some(false), None)
+                };
+                match apply_desktop_lyrics(app, next_visible, next_locked) {
+                    Ok(status) => broadcast_desktop_lyrics(app, &status),
+                    Err(e) => eprintln!("toggle desktop lyrics failed: {e}"),
+                }
+            }
+            "toggle" => send_playback_command(app, "toggle"),
+            "prev" => send_playback_command(app, "prev"),
+            "next" => send_playback_command(app, "next"),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+
+    // Media keys: best-effort — macOS may refuse without accessibility rights.
+    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
+    let shortcuts = [
+        (Code::MediaPlayPause, "toggle"),
+        (Code::MediaTrackNext, "next"),
+        (Code::MediaTrackPrevious, "prev"),
+    ];
+    for (code, action) in shortcuts {
+        let shortcut = Shortcut::new(None, code);
+        let result = app.global_shortcut().on_shortcut(shortcut, move |app, _, event| {
+            if event.state() == ShortcutState::Pressed {
+                send_playback_command(app, action);
+            }
+        });
+        if let Err(e) = result {
+            eprintln!("register media key {code:?} failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn reveal_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg(desktop)]
 static DESKTOP_LYRICS_LOCKED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -124,10 +237,17 @@ fn set_desktop_lyrics(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_media_session::init())
+        .plugin(tauri_plugin_media_session::init());
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    }
+
+    builder
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -171,6 +291,22 @@ pub fn run() {
                 cover_dir,
             };
             app.manage(state);
+
+            #[cfg(desktop)]
+            {
+                setup_desktop(app.handle())?;
+                // Closing the window keeps playback alive in the tray; quit from
+                // the tray menu instead.
+                if let Some(window) = app.get_webview_window("main") {
+                    let win = window.clone();
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = win.hide();
+                        }
+                    });
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -190,6 +326,7 @@ pub fn run() {
             commands::toggle_favorite,
             commands::create_playlist,
             commands::delete_playlist,
+            commands::import_playlist_from_url,
             commands::add_to_playlist,
             commands::rename_playlist,
             commands::remove_from_playlist,
@@ -204,6 +341,10 @@ pub fn run() {
             commands::download_track,
             commands::scan_local_tracks,
             commands::fetch_cover,
+            commands::get_cache_stats,
+            commands::clear_cache,
+            update::check_update,
+            set_desktop_lyrics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
