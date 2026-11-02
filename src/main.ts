@@ -1170,6 +1170,35 @@ function paintMuteButton() {
   btn.setAttribute("title", state.muted || state.volume <= 0.001 ? "取消静音" : "静音");
 }
 
+/** Shared inline SVG icon set — 24×24, stroke style matches volumeIconSvg. */
+function iconSvg(inner: string, filled = false): string {
+  const attrs = filled
+    ? 'fill="currentColor" stroke="none"'
+    : 'fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"';
+  return `<svg viewBox="0 0 24 24" aria-hidden="true" ${attrs}>${inner}</svg>`;
+}
+
+const HEART_PATH =
+  "M12 20.2C6.6 16.8 3.2 13.6 3.2 10.3c0-2.5 2-4.5 4.5-4.5 1.7 0 3.2.9 4.3 2.3 1.1-1.4 2.6-2.3 4.3-2.3 2.5 0 4.5 2 4.5 4.5 0 3.3-3.4 6.5-8.8 9.9z";
+const MUSIC_NOTE_PATH = "M9 18V5l12-2v13";
+
+const ICO = {
+  discover: iconSvg(
+    `<circle cx="12" cy="12" r="9"/><path class="needle" d="m14.9 9.1-1.7 4.1-4.1 1.7 1.7-4.1z"/>`,
+  ),
+  heart: iconSvg(`<path d="${HEART_PATH}"/>`),
+  heartFill: iconSvg(`<path d="${HEART_PATH}"/>`, true),
+  gear: iconSvg(
+    `<circle cx="12" cy="12" r="3.1"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>`,
+  ),
+  play: iconSvg(`<path d="M8 5.4v13.2L18.6 12z"/>`, true),
+  pause: iconSvg(`<path d="M6.6 5h3.4v14H6.6zM14 5h3.4v14H14z"/>`, true),
+  prev: iconSvg(`<path d="M6 5h2.4v14H6z"/><path d="M20 5v14L9.8 12z"/>`, true),
+  next: iconSvg(`<path d="M15.6 5H18v14h-2.4z"/><path d="M4 5v14l10.2-7z"/>`, true),
+  note: iconSvg(`<path d="${MUSIC_NOTE_PATH}"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>`),
+  spinner: `<svg class="spin" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5" stroke-dasharray="14 40"/></svg>`,
+};
+
 function applyVolume(next: number, opts?: { persist?: boolean; fromMute?: boolean }) {
   const v = Math.min(1, Math.max(0, next));
   state.volume = v;
@@ -3359,7 +3388,7 @@ function isFavorite(uid: string): boolean {
 
 function favButton(uid: string): string {
   const on = isFavorite(uid);
-  return `<span class="fav-btn${on ? " is-fav" : ""}" data-fav-uid="${escapeAttr(uid)}" title="${on ? "取消收藏" : "收藏"}" role="button" aria-pressed="${on}">${on ? "♥" : "♡"}</span>`;
+  return `<span class="fav-btn${on ? " is-fav" : ""}" data-fav-uid="${escapeAttr(uid)}" title="${on ? "取消收藏" : "收藏"}" role="button" aria-pressed="${on}">${on ? ICO.heartFill : ICO.heart}</span>`;
 }
 
 function storedToTrack(s: LibrarySnapshot["favorites"][number]): Track {
@@ -3643,7 +3672,7 @@ function renderDiscover(): string {
           <button class="playlist-card rec-item" type="button" style="--i:${i}" data-playlist-id="${escapeAttr(p.id)}">
             <div class="cover-wrap">
               <img src="${escapeAttr(coverPlaceholder())}"${coverAttrs({ cover: p.cover || p.tracks[0]?.cover } as Track)} alt="" loading="lazy" decoding="async" />
-              <span class="play-badge">▶</span>
+              <span class="play-badge">${ICO.play}</span>
             </div>
             <div class="title">${escapeHtml(p.name)}</div>
             <div class="sub">${escapeHtml(p.subtitle)} · ${p.trackCount} 首</div>
@@ -3937,6 +3966,19 @@ function renderSettings(): string {
   return `
     <h1 class="page-title page-title-sm">设置</h1>
     <div class="settings-stack">
+      <div class="settings-card about-card">
+        <div class="about-logo">
+          <img src="${logoUrl}" alt="猫耳收音机" />
+          <span class="about-note n1">${ICO.note}</span>
+          <span class="about-note n2">${ICO.note}</span>
+          <span class="about-note n3">${ICO.note}</span>
+        </div>
+        <div class="about-meta">
+          <h3>猫耳收音机</h3>
+          <span class="hint">v${escapeHtml(state.updateInfo?.current ?? "0.2.2")} · 一只爱听歌的猫</span>
+        </div>
+        <span class="about-eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      </div>
       <div class="settings-card">
         <h3>导入音源</h3>
         <div class="path-row">
@@ -4164,11 +4206,14 @@ function renderPlayerDockHtml(): string {
   const current = state.current;
   const showLyrics = state.lyricsOpen;
   return `
-      <footer class="player-dock">
+      <footer class="player-dock${state.playing ? " is-playing" : ""}">
         ${
           current
             ? `<button class="player-now" type="button" id="toggle-lyrics" title="查看歌词">
-                <img class="cover" src="${coverPlaceholder()}"${coverAttrs(current, "full")} alt="" decoding="async" />
+                <span class="dock-cover-wrap">
+                  <img class="cover" src="${coverPlaceholder()}"${coverAttrs(current, "full")} alt="" decoding="async" />
+                  <span class="cover-eq" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+                </span>
                 <div class="meta">
                   <div class="title">${escapeHtml(current.title)}</div>
                   <div class="sub">${
@@ -4188,11 +4233,11 @@ function renderPlayerDockHtml(): string {
         }
         <div class="player-controls">
           <div class="btns">
-            <button class="icon-btn" id="btn-prev" type="button" title="上一首">⏮</button>
+            <button class="icon-btn" id="btn-prev" type="button" title="上一首">${ICO.prev}</button>
             <button class="icon-btn primary" id="btn-pp" type="button" title="播放/暂停">${
-              state.preparing ? "…" : state.playing ? "⏸" : "▶"
+              state.preparing ? ICO.spinner : state.playing ? ICO.pause : ICO.play
             }</button>
-            <button class="icon-btn" id="btn-next" type="button" title="下一首">⏭</button>
+            <button class="icon-btn" id="btn-next" type="button" title="下一首">${ICO.next}</button>
           </div>
         </div>
         <div class="time-row">
@@ -4249,13 +4294,13 @@ function render() {
         </div>
         <nav class="nav">
           <button data-tab="discover" class="${state.tab === "discover" ? "active" : ""}" type="button">
-            <span class="nav-ico">♪</span><span class="label">发现</span>
+            <span class="nav-ico ico-discover">${ICO.discover}</span><span class="label">发现</span>
           </button>
           <button data-tab="library" class="${state.tab === "library" ? "active" : ""}" type="button">
-            <span class="nav-ico">♡</span><span class="label">我的</span>
+            <span class="nav-ico ico-heart">${ICO.heart}</span><span class="label">我的</span>
           </button>
           <button data-tab="settings" class="${state.tab === "settings" ? "active" : ""}" type="button">
-            <span class="nav-ico">⚙</span><span class="label">设置</span>
+            <span class="nav-ico ico-gear">${ICO.gear}</span><span class="label">设置</span>
           </button>
         </nav>
       </aside>
@@ -5100,7 +5145,8 @@ audio.addEventListener("play", () => {
   state.playing = true;
   void maybeAttachEq();
   const btn = document.querySelector("#btn-pp");
-  if (btn) btn.textContent = "⏸";
+  if (btn) btn.innerHTML = ICO.pause;
+  document.querySelector(".player-dock")?.classList.add("is-playing");
   bouncePlayButton();
   patchTrackRowActive();
   syncOsMediaPlaybackState(true);
@@ -5111,7 +5157,8 @@ audio.addEventListener("play", () => {
 audio.addEventListener("pause", () => {
   state.playing = false;
   const btn = document.querySelector("#btn-pp");
-  if (btn) btn.textContent = "▶";
+  if (btn) btn.innerHTML = ICO.play;
+  document.querySelector(".player-dock")?.classList.remove("is-playing");
   bouncePlayButton();
   patchTrackRowActive();
   syncOsMediaPlaybackState(false);

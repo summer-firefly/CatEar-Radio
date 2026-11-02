@@ -2903,3 +2903,306 @@ textarea.import-box {
     display: none;
   }
 }
+
+/* —— SVG icon sizing & motion —— */
+.nav-ico svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+  transition: transform 0.35s var(--ease-spring);
+}
+
+.nav button:hover .ico-gear svg,
+.nav button.active .ico-gear svg {
+  animation: gear-spin 5s linear infinite;
+}
+
+.nav button:hover .ico-heart svg {
+  animation: heart-pop 0.5s var(--ease-spring);
+}
+
+.nav button.active .ico-heart svg path {
+  fill: currentColor;
+}
+
+.nav button:hover .ico-discover svg .needle,
+.nav button.active .ico-discover svg .needle {
+  animation: needle-swing 1.6s ease-in-out infinite;
+  transform-origin: 12px 12px;
+}
+
+.icon-btn svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
+.icon-btn.primary svg {
+  width: 23px;
+  height: 23px;
+}
+
+.icon-btn svg.spin {
+  animation: icon-rot 0.9s linear infinite;
+}
+
+.fav-btn svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.fav-btn.is-fav svg {
+  animation: heart-pop 0.45s var(--ease-spring);
+}
+
+.play-badge svg {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+
+/* Playing indicator: equalizer bars over the dock cover. */
+.dock-cover-wrap {
+  position: relative;
+  display: block;
+  flex-shrink: 0;
+}
+
+.cover-eq {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  left: 3px;
+  height: 14px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  padding: 2px 0;
+  border-radius: 6px;
+  background: rgba(6, 14, 30, 0.45);
+  opacity: 0;
+  transform: translateY(3px);
+  transition:
+    opacity 0.25s var(--ease-out),
+    transform 0.25s var(--ease-out);
+  pointer-events: none;
+}
+
+.player-dock.is-playing .cover-eq {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.cover-eq i {
+  width: 3px;
+  height: 30%;
+  border-radius: 2px;
+  background: var(--accent-soft);
+}
+
+.player-dock.is-playing .cover-eq i {
+  animation: eq-bounce 0.9s ease-in-out infinite;
+}
+
+.cover-eq i:nth-child(2) {
+  animation-delay: 0.22s;
+}
+
+.cover-eq i:nth-child(3) {
+  animation-delay: 0.45s;
+}
+
+.cover-eq i:nth-child(4) {
+  animation-delay: 0.13s;
+}
+
+/* Brand mark: playful bounce on hover. */
+.brand-mark {
+  transition: transform 0.4s var(--ease-spring);
+}
+
+.brand-block:hover .brand-mark {
+  transform: rotate(-6deg) scale(1.08);
+}
+
+/* —— About card with animated logo —— */
+.about-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  overflow: hidden;
+}
+
+.about-logo {
+  position: relative;
+  width: 72px;
+  height: 72px;
+  flex-shrink: 0;
+}
+
+.about-logo img {
+  width: 100%;
+  height: 100%;
+  border-radius: 18px;
+  display: block;
+  box-shadow: 0 6px 20px rgba(var(--accent-rgb), 0.35);
+  animation: logo-breathe 3.2s ease-in-out infinite;
+}
+
+.about-note {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  color: var(--accent-soft);
+  opacity: 0;
+  animation: note-float 3s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.about-note svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.about-note.n1 {
+  right: -4px;
+  top: 2px;
+}
+
+.about-note.n2 {
+  right: 10px;
+  top: -8px;
+  width: 13px;
+  height: 13px;
+  animation-delay: 1s;
+}
+
+.about-note.n3 {
+  left: -6px;
+  top: 10px;
+  width: 14px;
+  height: 14px;
+  animation-delay: 2s;
+}
+
+.about-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.about-meta h3 {
+  margin: 0;
+}
+
+.about-eq {
+  margin-left: auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 26px;
+}
+
+.about-eq i {
+  width: 4px;
+  height: 30%;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--accent-soft), var(--accent));
+  animation: eq-bounce 1.1s ease-in-out infinite;
+}
+
+.about-eq i:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.about-eq i:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+.about-eq i:nth-child(4) {
+  animation-delay: 0.09s;
+}
+
+.about-eq i:nth-child(5) {
+  animation-delay: 0.27s;
+}
+
+@keyframes icon-rot {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes gear-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes heart-pop {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.3);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes needle-swing {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  30% {
+    transform: rotate(28deg);
+  }
+  65% {
+    transform: rotate(-16deg);
+  }
+}
+
+@keyframes eq-bounce {
+  0%,
+  100% {
+    height: 25%;
+  }
+  50% {
+    height: 100%;
+  }
+}
+
+@keyframes logo-breathe {
+  0%,
+  100% {
+    box-shadow: 0 6px 20px rgba(var(--accent-rgb), 0.3);
+    transform: translateY(0);
+  }
+  50% {
+    box-shadow: 0 10px 28px rgba(var(--accent-rgb), 0.55);
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes note-float {
+  0% {
+    opacity: 0;
+    transform: translateY(4px) scale(0.7) rotate(-8deg);
+  }
+  25% {
+    opacity: 1;
+  }
+  70% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-14px) scale(1) rotate(10deg);
+  }
+}
