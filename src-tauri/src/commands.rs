@@ -355,6 +355,31 @@ pub fn delete_playlist(state: State<'_, AppState>, id: String) {
     state.library.delete_playlist(&id);
 }
 
+const PLAYLIST_IMPORT_LIMIT: usize = 300;
+
+/// Import a shared NetEase / QQ Music playlist link into a local playlist.
+#[tauri::command]
+pub async fn import_playlist_from_url(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<StoredPlaylist, String> {
+    let link = crate::source::resolve_link(&url).await?;
+    let settings = state.settings.get();
+    let (registry, _) = load_sources(&app, &settings);
+    // The meting mirror serves both platforms, so the NetEase base covers QQ too.
+    let meting_base = registry
+        .base_url(crate::model::MusicSourceId::Netease)
+        .ok_or_else(|| "网易云音源未配置，无法导入歌单".to_string())?;
+    let tracks =
+        crate::source::fetch_tracks(&link, &meting_base, PLAYLIST_IMPORT_LIMIT).await?;
+    let fallback = format!("{} 歌单 {}", link.source.label(), link.id);
+    let name = crate::source::fetch_title(&link)
+        .await
+        .unwrap_or(fallback);
+    Ok(state.library.create_playlist_with_tracks(&name, &tracks))
+}
+
 #[tauri::command]
 pub fn add_to_playlist(
     state: State<'_, AppState>,

@@ -78,6 +78,26 @@ impl LibraryStore {
         playlist
     }
 
+    /// Create a playlist pre-filled with tracks in one write — importing a shared
+    /// playlist would otherwise persist once per song.
+    pub fn create_playlist_with_tracks(&self, name: &str, tracks: &[Track]) -> StoredPlaylist {
+        let mut playlist = StoredPlaylist {
+            id: Uuid::new_v4().to_string(),
+            name: name.trim().to_string(),
+            tracks: Vec::new(),
+        };
+        for track in tracks {
+            if playlist.tracks.iter().any(|t| t.uid == track.uid) {
+                continue;
+            }
+            playlist.tracks.push(StoredTrack::from(track));
+        }
+        let mut data = self.data.lock();
+        data.playlists.push(playlist.clone());
+        self.persist(&data);
+        playlist
+    }
+
     pub fn delete_playlist(&self, id: &str) {
         let mut data = self.data.lock();
         data.playlists.retain(|p| p.id != id);

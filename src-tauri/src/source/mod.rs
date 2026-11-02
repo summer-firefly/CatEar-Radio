@@ -1,11 +1,13 @@
 mod config;
 mod kuwo;
 mod netease;
+mod playlist;
 mod qq;
 
 pub use config::{ensure_builtin_sources, SourceManifest, SourceRegistry};
 pub use kuwo::KuwoMusicSource;
 pub use netease::NeteaseMusicSource;
+pub use playlist::{fetch_title, fetch_tracks, resolve_link};
 pub use qq::QqMusicSource;
 
 use std::collections::HashMap;
@@ -95,4 +97,28 @@ pub(crate) async fn get_text(url: &str) -> Result<String, String> {
         return Err(format!("http {}", resp.status()));
     }
     resp.text().await.map_err(|e| e.to_string())
+}
+
+/// Some upstreams (QQ's own web API) reject requests without a site referer.
+pub(crate) async fn get_text_with_referer(url: &str, referer: &str) -> Result<String, String> {
+    let resp = http_client()
+        .get(url)
+        .header(reqwest::header::REFERER, referer)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("http {}", resp.status()));
+    }
+    resp.text().await.map_err(|e| e.to_string())
+}
+
+/// Follow redirects for share short links (163cn.tv) and return the final URL.
+pub(crate) async fn resolve_final_url(url: &str) -> Result<String, String> {
+    let resp = http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.url().to_string())
 }
