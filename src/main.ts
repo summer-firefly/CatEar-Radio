@@ -1,17 +1,31 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emitTo } from "@tauri-apps/api/event";
 import "./assets/fonts/fonts.css";
 import "./styles.css";
 import logoUrl from "./assets/logo.png";
 import { formatTime, parseLrc } from "./lrc";
 import {
+  attach,
+  canProcess,
+  EQ_BANDS,
+  EQ_GAIN_RANGE,
+  EQ_PRESETS,
+  isAttached,
+  setGains,
+  setPreamp,
+} from "./equalizer";
+import { matchesAnyField } from "./pinyin";
+import {
   initOsMediaControls,
+  syncOsMediaPlaybackRate,
   syncOsMediaPlaybackState,
   syncOsMediaPosition,
+  syncOsMediaSkipAvailability,
   syncOsMediaTrack,
 } from "./os-media";
 import type {
   AppSettings,
+  CacheStats,
   DownloadDirPreset,
   LibrarySnapshot,
   LyricLine,
@@ -21,8 +35,10 @@ import type {
   SearchPageResult,
   SourceInfo,
   SourceSearchError,
+  StoredPlaylist,
   TabId,
   Track,
+  UpdateInfo,
 } from "./types";
 
 function isAndroid(): boolean {
@@ -63,9 +79,19 @@ const VOLUME_KEY = "maoer-volume";
 const RECENT_KEY = "maoer-recent";
 const RECENT_MAX = 50;
 const LYRIC_FONT_KEY = "maoer-lyric-font";
+const LYRIC_TRANSLATION_KEY = "maoer-lyric-translation";
 const LYRIC_OFFSET_KEY = "maoer-lyric-offset";
 const LYRIC_OFFSET_MAP_KEY = "maoer-lyric-offset-map";
 type LyricFontSize = "sm" | "md" | "lg";
+
+/** Bilingual subtitles default on — the line is only rendered when one exists. */
+function loadLyricTranslation(): boolean {
+  try {
+    return localStorage.getItem(LYRIC_TRANSLATION_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
 
 function loadLyricFont(): LyricFontSize {
   try {
@@ -282,6 +308,11 @@ const state = {
   downloadQueue: [] as Track[],
   /** Live byte progress of in-flight downloads, keyed by track uid. */
   downloadProgress: {} as Record<string, { downloaded: number; total: number }>,
+  /** Last cache occupancy reported by the backend. */
+  cacheStats: null as null | CacheStats,
+  /** Latest version check result; null until the user asks. */
+  updateInfo: null as null | UpdateInfo,
+  checkingUpdate: false,
   sources: [] as SourceInfo[],
   library: null as LibrarySnapshot | null,
   libraryPane: "favorites" as "favorites" | "recent" | "playlists" | "local",
@@ -300,15 +331,33 @@ const state = {
   volume: loadVolume(),
   muted: false,
   volumeBeforeMute: loadVolume(),
+  /** Playback speed — persisted, applied to both audio elements. */
+  playRate: loadPlayRate(),
+  /** WebAudio equalizer — off by default so plain playback is never rerouted. */
+  eq: {
+    enabled: loadEqEnabled(),
+    preset: loadEqPreset(),
+    gains: loadEqGains(),
+    preamp: loadEqPreamp(),
+  },
   playMode: "list" as PlayMode,
   lyrics: [] as LyricLine[],
   lyricsOpen: false,
   lyricFont: loadLyricFont() as LyricFontSize,
+  /** Show the translated line under the original when one exists. */
+  lyricTranslation: loadLyricTranslation(),
   /** Fallback offset used when the current track has no per-track override. */
   lyricOffsetDefault: loadLyricOffset(),
   /** Per-track lyric offsets keyed by track uid. */
   lyricOffsetMap: loadLyricOffsetMap(),
   toast: "",
+  /** Light/dark appearance — persisted, applied on <html data-theme>. */
+  theme: loadTheme(),
+  /** Frameless always-on-top lyrics overlay (desktop only). */
+  desktopLyrics: {
+    visible: loadDesktopLyricsVisible(),
+    locked: false,
+  },
   page: 1,
   /** Whether a newer search page likely exists (based on last page size). */
   searchHasMore: false,
@@ -319,6 +368,19 @@ const state = {
   recentPage: 1,
   browsePlaylistId: null as string | null,
   browsePage: 1,
+  /** Artist / album drill-down opened from a track row. */
+  detail: null as null | {
+    kind: "artist" | "album";
+    name: string;
+    /** Seed artist — needed as part of the album search keyword. */
+    artist: string;
+    tracks: Track[];
+    loading: boolean;
+    /** Set when the source returned no album field and we fell back to a keyword search. */
+    note: string;
+    error: string;
+    page: number;
+  },
   /** Sleep timer: timed countdown or stop after current track. */
   sleep: null as null | { mode: "timed"; endsAt: number; minutes: number } | { mode: "track" },
   /** One-shot enter animation after a full recommend reload. */
@@ -327,6 +389,7 @@ const state = {
   dialog: null as
     | null
     | { kind: "new-playlist" }
+    | { kind: "import-playlist"; url: string; busy?: boolean }
     | { kind: "rename-playlist"; id: string; name: string }
     | { kind: "delete-playlist"; id: string; name: string }
     | { kind: "add-to-playlist"; trackUid: string }
@@ -345,6 +408,223 @@ let ignoreRecommendEventsUntil = 0;
 
 const SEARCH_HISTORY_KEY = "maoer-search-history";
 const SEARCH_HISTORY_MAX = 12;
+
+const THEME_KEY = "maoer-theme";
+type Theme = "dark" | "light";
+
+function loadTheme(): Theme {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    if (v === "light" || v === "dark") return v;
+  } catch {
+    /* ignore */
+  }
+  return "dark";
+}
+
+/** Tokens live in `html[data-theme]`, so flipping the attribute retints everything. */
+function applyTheme(theme: Theme) {
+  document.documentElement.dataset.theme = theme;
+}
+
+function setTheme(theme: Theme, opts?: { silent?: boolean }) {
+  state.theme = theme;
+  applyTheme(theme);
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch {
+    /* ignore */
+  }
+  patchThemeToggle();
+  if (state.desktopLyrics.visible) pushDesktopLyricsState({ immediate: true });
+  if (!opts?.silent) toast(theme === "light" ? "已切换浅色主题" : "已切换深色主题");
+}
+
+function toggleTheme() {
+  setTheme(state.theme === "light" ? "dark" : "light");
+}
+
+/* —— Desktop lyrics overlay (frameless always-on-top window) —— */
+
+const DESKTOP_LYRICS_KEY = "maoer-desktop-lyrics";
+
+interface DesktopLyricsStatus {
+  visible: boolean;
+  locked: boolean;
+}
+
+/** Payload pushed to the overlay window; `lyrics` is null unless the track changed. */
+interface DesktopLyricsPayload {
+  uid: string;
+  title: string;
+  artist: string;
+  lyrics: LyricLine[] | null;
+  position: number;
+  playing: boolean;
+  theme: Theme;
+  offset: number;
+}
+
+function loadDesktopLyricsVisible(): boolean {
+  try {
+    return localStorage.getItem(DESKTOP_LYRICS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Track whose lyrics the overlay already holds — only resend on change. */
+let desktopLyricsSentUid = "";
+let desktopLyricsTimer = 0;
+
+function buildDesktopLyricsPayload(full: boolean): DesktopLyricsPayload {
+  const track = state.current;
+  return {
+    uid: track?.uid ?? "",
+    title: track?.title ?? "",
+    artist: track?.artist ?? "",
+    // The overlay has its own line layout, so word timings are dropped.
+    lyrics: full ? overlayLyrics() : null,
+    position: state.position,
+    playing: state.playing,
+    theme: state.theme,
+    offset: lyricOffsetFor(track?.uid),
+  };
+}
+
+/** Overlay view of the lyrics — honours the translation toggle. */
+function overlayLyrics(): LyricLine[] {
+  return state.lyrics.map((line) => ({
+    time: line.time,
+    text: line.text,
+    translation: state.lyricTranslation ? line.translation : undefined,
+  }));
+}
+
+/** Keep the overlay in sync — throttled, and skipped entirely while it is hidden. */
+function pushDesktopLyricsState(opts?: { immediate?: boolean; full?: boolean }) {
+  if (!state.desktopLyrics.visible || isAndroid()) return;
+  const send = () => {
+    desktopLyricsTimer = 0;
+    const uid = state.current?.uid ?? "";
+    const full = opts?.full === true || uid !== desktopLyricsSentUid;
+    desktopLyricsSentUid = uid;
+    void emitTo("desktop-lyrics", "desktop-lyrics-state", buildDesktopLyricsPayload(full)).catch(
+      () => undefined,
+    );
+  };
+  if (opts?.immediate) {
+    if (desktopLyricsTimer) window.clearTimeout(desktopLyricsTimer);
+    send();
+    return;
+  }
+  if (desktopLyricsTimer) return;
+  desktopLyricsTimer = window.setTimeout(send, 250);
+}
+
+function applyDesktopLyricsStatus(status: DesktopLyricsStatus) {
+  state.desktopLyrics.visible = status.visible;
+  state.desktopLyrics.locked = status.locked;
+  try {
+    localStorage.setItem(DESKTOP_LYRICS_KEY, status.visible ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+  // The settings card swaps the unlock button / hint, so it needs a full repaint.
+  if (state.tab === "settings") renderMain();
+  else patchDesktopLyricsToggle();
+}
+
+function patchDesktopLyricsToggle() {
+  const btn = document.querySelector("#btn-desktop-lyrics");
+  if (!btn) return;
+  btn.textContent = state.desktopLyrics.visible ? "已开启" : "关闭";
+  btn.setAttribute("aria-pressed", String(state.desktopLyrics.visible));
+}
+
+async function setDesktopLyrics(visible: boolean, opts?: { silent?: boolean }) {
+  if (isAndroid()) return;
+  try {
+    // Showing always unlocks: a click-through window that reappears is confusing.
+    const status = await invoke<DesktopLyricsStatus>("set_desktop_lyrics", {
+      visible,
+      locked: visible ? false : null,
+    });
+    desktopLyricsSentUid = "";
+    applyDesktopLyricsStatus(status);
+    if (!opts?.silent) toast(visible ? "桌面歌词已开启" : "桌面歌词已关闭");
+    if (visible) pushDesktopLyricsState({ immediate: true, full: true });
+  } catch (e) {
+    if (!opts?.silent) toast(`桌面歌词不可用：${String(e)}`);
+  }
+}
+
+function toggleDesktopLyrics() {
+  void setDesktopLyrics(!state.desktopLyrics.visible);
+}
+
+/** Click-through unlock; the overlay itself is unreachable while locked. */
+async function unlockDesktopLyrics() {
+  try {
+    const status = await invoke<DesktopLyricsStatus>("set_desktop_lyrics", { locked: false });
+    applyDesktopLyricsStatus(status);
+    toast("桌面歌词已解锁");
+  } catch (e) {
+    toast(`解锁失败：${String(e)}`);
+  }
+}
+
+/** Click-through mode — the overlay can no longer receive clicks after this. */
+async function lockDesktopLyrics() {
+  try {
+    const status = await invoke<DesktopLyricsStatus>("set_desktop_lyrics", { locked: true });
+    applyDesktopLyricsStatus(status);
+    toast("桌面歌词已锁定，可从托盘或设置解锁");
+  } catch (e) {
+    toast(`锁定失败：${String(e)}`);
+  }
+}
+
+/** Overlay button events plus its "I just booted, send me state" handshake. */
+async function listenDesktopLyrics() {
+  try {
+    // Tray toggles happen in Rust — mirror whatever it decided.
+    await listen<DesktopLyricsStatus>("desktop-lyrics-status", (event) => {
+      const wasVisible = state.desktopLyrics.visible;
+      desktopLyricsSentUid = "";
+      applyDesktopLyricsStatus(event.payload);
+      if (event.payload.visible || wasVisible) {
+        pushDesktopLyricsState({ immediate: true, full: true });
+      }
+    });
+    await listen("desktop-lyrics-ready", () => {
+      // The hidden overlay window loads at startup too — only answer while shown.
+      if (!state.desktopLyrics.visible) return;
+      desktopLyricsSentUid = "";
+      pushDesktopLyricsState({ immediate: true, full: true });
+    });
+    await listen<"lock" | "close">("desktop-lyrics-action", (event) => {
+      if (event.payload === "close") {
+        void setDesktopLyrics(false);
+        return;
+      }
+      void lockDesktopLyrics();
+    });
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+/** Repaint only the toggle so switching does not rebuild the settings page. */
+function patchThemeToggle() {
+  const btn = document.querySelector("#btn-theme-toggle");
+  if (btn) {
+    btn.textContent = state.theme === "light" ? "浅色" : "深色";
+    btn.setAttribute("aria-pressed", String(state.theme === "light"));
+  }
+  const quick = document.querySelector("#btn-theme-quick");
+  if (quick) quick.textContent = state.theme === "light" ? "☾" : "☀";
+}
 
 function loadSearchHistory(): string[] {
   try {
@@ -373,6 +653,172 @@ function clearSearchHistory() {
   localStorage.removeItem(SEARCH_HISTORY_KEY);
 }
 
+/** Shown before the recommendation catalog has loaded. */
+const HOT_FALLBACK = ["周杰伦", "林俊杰", "晴天", "夜曲", "陈奕迅", "五月天", "稻香", "孤勇者"];
+const SUGGEST_MAX = 6;
+
+/**
+ * Hot keywords straight from the recommendation catalog, so they follow
+ * whatever the sources currently promote. Artists come first because that is
+ * what people type most; titles and a static fallback fill the rest.
+ */
+function hotKeywords(): string[] {
+  const hot = state.recommend?.hotTracks ?? [];
+  const words: string[] = [];
+  const push = (word: string) => {
+    const value = word.trim();
+    if (value && !words.includes(value)) words.push(value);
+  };
+  for (const track of hot) {
+    for (const artist of track.artist.split(/[/,、&;，]/)) push(artist);
+    if (words.length >= 8) break;
+  }
+  for (const track of hot) {
+    push(track.title);
+    if (words.length >= 10) break;
+  }
+  for (const word of HOT_FALLBACK) {
+    if (words.length >= 10) break;
+    push(word);
+  }
+  return words.slice(0, 10);
+}
+
+/** Zero-network matches from what the app already holds — instant suggestions. */
+function localSuggestions(query: string): Track[] {
+  const q = query.trim();
+  if (!q) return [];
+  const pools = [
+    state.localTracks,
+    (state.library?.favorites ?? []).map(storedToTrack),
+    state.recent,
+    state.recommend?.hotTracks ?? [],
+    state.searchAccum,
+  ];
+  const seen = new Set<string>();
+  const hits: Track[] = [];
+  for (const pool of pools) {
+    for (const track of pool) {
+      if (hits.length >= SUGGEST_MAX) return hits;
+      if (seen.has(track.uid)) continue;
+      // Pinyin aware: "xxy" and "xiaoxingyun" both find 小幸运.
+      if (!matchesAnyField([track.title, track.artist, track.album], q)) continue;
+      seen.add(track.uid);
+      hits.push(track);
+    }
+  }
+  return hits;
+}
+
+function searchSuggestHtml(): string {
+  const query = state.keyword.trim();
+  if (query) {
+    const hits = localSuggestions(query);
+    return `<div class="search-history" id="search-history">
+      <div class="search-history-head"><span>本地结果</span></div>
+      ${
+        hits.length
+          ? hits
+              .map(
+                (track) => `
+        <button type="button" class="search-history-item" data-suggest-uid="${escapeAttr(track.uid)}">
+          <span class="search-history-text">${escapeHtml(track.title || "未知歌曲")}<span class="suggest-sub">${escapeHtml(track.artist)}</span></span>
+        </button>`,
+              )
+              .join("")
+          : `<div class="search-empty">没有本地匹配，按回车在全部音源搜索</div>`
+      }
+    </div>`;
+  }
+  const history = loadSearchHistory();
+  const hot = hotKeywords();
+  return `<div class="search-history" id="search-history">
+    ${
+      history.length
+        ? `<div class="search-history-head">
+            <span>搜索历史</span>
+            <button type="button" class="search-history-clear" id="btn-clear-history">清空</button>
+          </div>
+          ${history
+            .map(
+              (item) => `
+          <button type="button" class="search-history-item" data-history="${escapeAttr(item)}">
+            <span class="search-history-text">${escapeHtml(item)}</span>
+            <span class="search-history-del" data-history-del="${escapeAttr(item)}" title="删除">×</span>
+          </button>`,
+            )
+            .join("")}`
+        : ""
+    }
+    ${
+      hot.length
+        ? `<div class="search-history-head"><span>热门搜索</span></div>
+          <div class="search-hot">
+            ${hot
+              .map(
+                (word) =>
+                  `<button type="button" class="search-hot-item" data-hot-word="${escapeAttr(word)}">${escapeHtml(word)}</button>`,
+              )
+              .join("")}
+          </div>`
+        : ""
+    }
+  </div>`;
+}
+
+/** Repaint the dropdown only — re-rendering the page would steal input focus. */
+function patchSearchSuggest() {
+  const host = document.querySelector("#search-suggest");
+  if (!host) return;
+  host.innerHTML = state.searchHistoryOpen ? searchSuggestHtml() : "";
+  if (state.searchHistoryOpen) bindSearchSuggestEvents();
+}
+
+/** Wire the freshly rendered dropdown; it is replaced on every keystroke. */
+function bindSearchSuggestEvents() {
+  document.querySelector("#btn-clear-history")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearSearchHistory();
+    patchSearchSuggest();
+  });
+  document.querySelectorAll<HTMLElement>("[data-history]").forEach((el) => {
+    el.addEventListener("mousedown", (e) => e.preventDefault());
+    el.addEventListener("click", (e) => {
+      const del = (e.target as HTMLElement).closest("[data-history-del]") as HTMLElement | null;
+      if (del) {
+        e.preventDefault();
+        e.stopPropagation();
+        removeSearchHistory(del.dataset.historyDel || "");
+        patchSearchSuggest();
+        return;
+      }
+      state.keyword = el.dataset.history || "";
+      void doSearch(true);
+    });
+  });
+  document.querySelectorAll<HTMLElement>("[data-hot-word]").forEach((el) => {
+    el.addEventListener("mousedown", (e) => e.preventDefault());
+    el.addEventListener("click", () => {
+      state.keyword = el.dataset.hotWord || "";
+      void doSearch(true);
+    });
+  });
+  document.querySelectorAll<HTMLElement>("[data-suggest-uid]").forEach((el) => {
+    el.addEventListener("mousedown", (e) => e.preventDefault());
+    el.addEventListener("click", () => {
+      const uid = el.dataset.suggestUid || "";
+      const hits = localSuggestions(state.keyword);
+      const track = hits.find((t) => t.uid === uid);
+      if (!track) return;
+      state.searchHistoryOpen = false;
+      detachSearchHistoryDocHandler();
+      patchSearchSuggest();
+      void playTrack(track, hits);
+    });
+  });
+}
+
 let playGeneration = 0;
 /** Saved position for a restored track — applied only when that exact track is loaded. */
 let pendingResume: { uid: string; seconds: number } | null = null;
@@ -394,7 +840,7 @@ function attachSearchHistoryDocHandler() {
     if (t?.closest?.(".search-field")) return;
     state.searchHistoryOpen = false;
     detachSearchHistoryDocHandler();
-    renderMain();
+    patchSearchSuggest();
   };
   // Defer so the focusing click doesn't close the panel immediately.
   window.setTimeout(() => {
@@ -409,6 +855,298 @@ audio.preload = "metadata";
 audio.volume = state.volume;
 // Do not set crossOrigin: many music CDNs omit CORS headers, which makes
 // HTMLMediaElement.play() reject with NotSupportedError in WKWebView.
+
+/** Outgoing track during a crossfade; idle (no src) the rest of the time. */
+const crossfadeAudio = new Audio();
+crossfadeAudio.preload = "auto";
+
+const PLAY_RATE_KEY = "maoer-play-rate";
+const PLAY_RATES = [0.75, 1, 1.25, 1.5, 2];
+
+function loadPlayRate(): number {
+  try {
+    const v = Number(localStorage.getItem(PLAY_RATE_KEY));
+    if (PLAY_RATES.includes(v)) return v;
+  } catch {
+    /* ignore */
+  }
+  return 1;
+}
+
+function playRateLabel(rate: number): string {
+  return `${rate}×`;
+}
+
+function setPlayRate(rate: number, opts?: { silent?: boolean }) {
+  state.playRate = PLAY_RATES.includes(rate) ? rate : 1;
+  audio.playbackRate = state.playRate;
+  crossfadeAudio.playbackRate = state.playRate;
+  syncOsMediaPlaybackRate(state.playRate, state.position, state.duration);
+  try {
+    localStorage.setItem(PLAY_RATE_KEY, String(state.playRate));
+  } catch {
+    /* ignore */
+  }
+  patchPlayerDock();
+  if (!opts?.silent) toast(`播放速度 ${playRateLabel(state.playRate)}`);
+}
+
+function cyclePlayRate() {
+  const idx = PLAY_RATES.indexOf(state.playRate);
+  setPlayRate(PLAY_RATES[(idx + 1) % PLAY_RATES.length]);
+}
+
+const EQ_ENABLED_KEY = "maoer-eq-enabled";
+const EQ_PRESET_KEY = "maoer-eq-preset";
+const EQ_GAINS_KEY = "maoer-eq-gains";
+const EQ_PREAMP_KEY = "maoer-eq-preamp";
+
+function loadEqEnabled(): boolean {
+  try {
+    return localStorage.getItem(EQ_ENABLED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function loadEqPreset(): string {
+  try {
+    const v = localStorage.getItem(EQ_PRESET_KEY);
+    if (v && EQ_PRESETS.some((p) => p.id === v)) return v;
+  } catch {
+    /* ignore */
+  }
+  return "flat";
+}
+
+function loadEqGains(): number[] {
+  const preset = EQ_PRESETS.find((p) => p.id === loadEqPreset());
+  const fallback = preset ? preset.gains : EQ_PRESETS[0].gains;
+  try {
+    const raw = localStorage.getItem(EQ_GAINS_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+    if (Array.isArray(parsed) && parsed.length === EQ_BANDS.length) {
+      return parsed.map((v, i) =>
+        typeof v === "number" && Number.isFinite(v)
+          ? Math.max(-EQ_GAIN_RANGE, Math.min(EQ_GAIN_RANGE, v))
+          : fallback[i],
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+  return [...fallback];
+}
+
+function loadEqPreamp(): number {
+  try {
+    const v = Number(localStorage.getItem(EQ_PREAMP_KEY));
+    if (Number.isFinite(v)) return Math.max(-EQ_GAIN_RANGE, Math.min(EQ_GAIN_RANGE, v));
+  } catch {
+    /* ignore */
+  }
+  return 0;
+}
+
+function persistEq() {
+  try {
+    localStorage.setItem(EQ_ENABLED_KEY, state.eq.enabled ? "1" : "0");
+    localStorage.setItem(EQ_PRESET_KEY, state.eq.preset);
+    localStorage.setItem(EQ_GAINS_KEY, JSON.stringify(state.eq.gains));
+    localStorage.setItem(EQ_PREAMP_KEY, String(state.eq.preamp));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+/** Apply the current gains to the graph; a no-op while it is not built. */
+function syncEqToGraph() {
+  setGains(state.eq.gains);
+  setPreamp(state.eq.preamp);
+}
+
+/**
+ * Turn the equalizer on/off.
+ *
+ * Enabling probes the current stream first: a cross-origin response without
+ * CORS becomes silent once routed through WebAudio, and that is irreversible.
+ */
+async function toggleEq(force?: boolean) {
+  const next = force ?? !state.eq.enabled;
+  if (next === state.eq.enabled) return;
+  if (!next) {
+    state.eq.enabled = false;
+    persistEq();
+    toast("均衡器已关闭，重启后生效");
+    renderMain();
+    return;
+  }
+  const src = audio.getAttribute("src");
+  if (src) {
+    const ok = await canProcess(src);
+    if (!ok) {
+      toast("该音频源不允许音频处理，均衡器无法开启");
+      return;
+    }
+  }
+  const error = attach(audio);
+  if (error) {
+    toast(error);
+    return;
+  }
+  state.eq.enabled = true;
+  syncEqToGraph();
+  persistEq();
+  toast("均衡器已开启");
+  renderMain();
+}
+
+/**
+ * Rebuild the graph on the first play after a restart — a fresh element loses
+ * the routing, so an enabled EQ would otherwise silently do nothing.
+ */
+async function maybeAttachEq() {
+  if (!state.eq.enabled || isAttached()) return;
+  const src = audio.getAttribute("src");
+  if (!src) return;
+  if (!(await canProcess(src))) {
+    state.eq.enabled = false;
+    persistEq();
+    toast("该音频源不允许音频处理，均衡器已自动关闭");
+    return;
+  }
+  const error = attach(audio);
+  if (error) {
+    state.eq.enabled = false;
+    persistEq();
+    toast(error);
+    return;
+  }
+  syncEqToGraph();
+}
+
+function applyEqPreset(id: string) {
+  const preset = EQ_PRESETS.find((p) => p.id === id);
+  if (!preset) return;
+  state.eq.preset = id;
+  state.eq.gains = [...preset.gains];
+  syncEqToGraph();
+  persistEq();
+  paintEqPanel();
+}
+
+function setEqBand(index: number, gain: number) {
+  state.eq.gains[index] = Math.max(-EQ_GAIN_RANGE, Math.min(EQ_GAIN_RANGE, gain));
+  // Touching a band means the sound is now custom.
+  state.eq.preset = "custom";
+  syncEqToGraph();
+  persistEq();
+  paintEqPanel();
+}
+
+function setEqPreampValue(db: number) {
+  state.eq.preamp = Math.max(-EQ_GAIN_RANGE, Math.min(EQ_GAIN_RANGE, db));
+  syncEqToGraph();
+  persistEq();
+  paintEqPanel();
+}
+
+/** Sliders are live; repaint the labels without rebuilding the settings page. */
+function paintEqPanel() {
+  EQ_BANDS.forEach((_, i) => {
+    const value = document.querySelector(`#eq-band-value-${i}`);
+    if (value) value.textContent = eqGainLabel(state.eq.gains[i]);
+    const slider = document.querySelector<HTMLInputElement>(`#eq-band-${i}`);
+    if (slider && document.activeElement !== slider) slider.value = String(state.eq.gains[i]);
+  });
+  const preampValue = document.querySelector("#eq-preamp-value");
+  if (preampValue) preampValue.textContent = eqGainLabel(state.eq.preamp);
+  document.querySelectorAll<HTMLElement>("[data-eq-preset]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.eqPreset === state.eq.preset);
+  });
+}
+
+function eqGainLabel(db: number): string {
+  return `${db > 0 ? "+" : ""}${db.toFixed(1)} dB`;
+}
+
+function eqPanelHtml(): string {
+  return `
+    <div class="settings-card">
+      <div class="eq-head">
+        <h3>均衡器</h3>
+        <button class="btn ghost sm" id="btn-eq-toggle" type="button" aria-pressed="${state.eq.enabled}">${
+          state.eq.enabled ? "已开启" : "关闭"
+        }</button>
+      </div>
+      <div class="eq-presets">
+        ${EQ_PRESETS.map(
+          (p) =>
+            `<button type="button" class="eq-preset${
+              state.eq.preset === p.id ? " active" : ""
+            }" data-eq-preset="${p.id}">${p.label}</button>`,
+        ).join("")}
+      </div>
+      <div class="eq-bands">
+        ${EQ_BANDS.map((freq, i) => {
+          const gain = state.eq.gains[i] ?? 0;
+          return `
+          <label class="eq-band">
+            <span class="eq-band-freq">${freq >= 1000 ? `${freq / 1000}k` : freq}</span>
+            <input type="range" id="eq-band-${i}" data-eq-band="${i}" min="-${EQ_GAIN_RANGE}" max="${EQ_GAIN_RANGE}" step="0.5" value="${gain}" aria-label="${freq} Hz" />
+            <span class="eq-band-value" id="eq-band-value-${i}">${eqGainLabel(gain)}</span>
+          </label>`;
+        }).join("")}
+      </div>
+      <div class="eq-preamp">
+        <span class="hint">前级</span>
+        <input type="range" id="eq-preamp" min="-${EQ_GAIN_RANGE}" max="${EQ_GAIN_RANGE}" step="0.5" value="${
+          state.eq.preamp
+        }" aria-label="前级增益" />
+        <span class="hint" id="eq-preamp-value">${eqGainLabel(state.eq.preamp)}</span>
+      </div>
+      <p class="settings-hint">${
+        state.eq.enabled
+          ? "调节会立即生效；部分音源不允许音频处理，此时无法开启。"
+          : "开启后音频会经过音效处理，切换音源时可能自动关闭。"
+      }</p>
+    </div>`;
+}
+
+/** Fade a secondary element down, then release it. */
+function fadeOutElement(el: HTMLAudioElement, ms: number) {
+  const from = el.volume;
+  const start = performance.now();
+  const step = (now: number) => {
+    const t = Math.min(1, (now - start) / ms);
+    el.volume = from * (1 - t);
+    if (t < 1) {
+      requestAnimationFrame(step);
+      return;
+    }
+    el.pause();
+    el.removeAttribute("src");
+  };
+  requestAnimationFrame(step);
+}
+
+/** Overlap the old track with the new one so switching never cuts mid-beat. */
+function crossfadeOutCurrent(ms = 420) {
+  if (!state.playing) return;
+  const src = audio.getAttribute("src");
+  if (!src) return;
+  try {
+    crossfadeAudio.src = src;
+    crossfadeAudio.currentTime = audio.currentTime;
+    crossfadeAudio.volume = audio.volume;
+    void crossfadeAudio.play().catch(() => {
+      /* the old source may already be gone */
+    });
+    fadeOutElement(crossfadeAudio, ms);
+  } catch {
+    /* crossfade is a nicety — never block the switch */
+  }
+}
 
 /** Flat stroke speaker icons — match the rest of the chrome. */
 function volumeIconSvg(vol: number, muted: boolean): string {
@@ -629,17 +1367,139 @@ function browsingPlaylist(): RecommendPlaylist | null {
 function clearBrowse() {
   state.browsePlaylistId = null;
   state.browsePage = 1;
+  // Playlist / search navigation always leaves the artist or album drill-down.
+  state.detail = null;
 }
 
 function openRecommendPlaylist(pl: RecommendPlaylist) {
   clearSearchResults();
+  state.detail = null;
   state.browsePlaylistId = pl.id;
   state.browsePage = 1;
   state.tab = "discover";
   if (pl.tracks.length) {
     void playTrack(pl.tracks[0], pl.tracks);
   }
-  render();
+  renderMain();
+}
+
+/** Case/space-insensitive containment test — sources spell artists differently. */
+function sameName(a: string, b: string): boolean {
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, "");
+  const left = norm(a);
+  const right = norm(b);
+  if (!left || !right) return false;
+  return left.includes(right) || right.includes(left);
+}
+
+/** Every track already in memory that passes `pick`, deduped by uid. */
+function knownTracksMatching(pick: (t: Track) => boolean): Track[] {
+  const pools: Track[][] = [
+    state.searchTracks,
+    state.searchAccum,
+    state.recent,
+    state.localTracks,
+    state.recommend?.hotTracks ?? [],
+    ...(state.recommend?.hotPlaylists ?? []).map((p) => p.tracks),
+    (state.library?.favorites ?? []).map(storedToTrack),
+    ...(state.library?.playlists ?? []).map((p) =>
+      p.tracks.map((t) => storedToTrack(t as LibrarySnapshot["favorites"][number])),
+    ),
+    state.queue,
+  ];
+  const seen = new Set<string>();
+  const out: Track[] = [];
+  for (const pool of pools) {
+    for (const track of pool) {
+      if (seen.has(track.uid) || !pick(track)) continue;
+      seen.add(track.uid);
+      out.push(track);
+    }
+  }
+  return out;
+}
+
+function detailKeyword(detail: NonNullable<typeof state.detail>): string {
+  return detail.kind === "artist"
+    ? detail.name
+    : `${detail.artist} ${detail.name}`.trim();
+}
+
+function openDetail(kind: "artist" | "album", name: string, artist = "") {
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  state.browsePlaylistId = null;
+  state.browsePage = 1;
+  state.detail = {
+    kind,
+    name: trimmed,
+    artist: artist.trim(),
+    tracks: [],
+    loading: true,
+    note: "",
+    error: "",
+    page: 1,
+  };
+  state.tab = "discover";
+  renderMain();
+  void loadDetail();
+}
+
+/**
+ * Sources only expose keyword search, so a detail page = known in-memory tracks
+ * for that name + one broad search. Album hits are filtered by album name because
+ * the keyword may match unrelated songs.
+ */
+async function loadDetail() {
+  const detail = state.detail;
+  if (!detail) return;
+  const match = (t: Track) =>
+    detail.kind === "artist" ? sameName(t.artist, detail.name) : sameName(t.album, detail.name);
+  const merged = knownTracksMatching(match);
+  const seen = new Set(merged.map((t) => t.uid));
+
+  let fetched: Track[] = [];
+  let error = "";
+  try {
+    const result = await invoke<SearchPageResult>("search_tracks", {
+      keyword: detailKeyword(detail),
+      page: 1,
+      reset: true,
+      limitPerSource: 30,
+    });
+    fetched = result.tracks ?? [];
+  } catch (e) {
+    error = String(e);
+  }
+  if (state.detail !== detail) return;
+
+  let relevant = detail.kind === "album" ? fetched.filter(match) : fetched;
+  let note = "";
+  if (detail.kind === "album" && !relevant.length && fetched.length) {
+    relevant = fetched;
+    note = "音源未返回专辑字段，以下为关键词搜索结果";
+  }
+  for (const track of relevant) {
+    if (seen.has(track.uid)) continue;
+    seen.add(track.uid);
+    merged.push(track);
+  }
+
+  detail.tracks = merged;
+  detail.loading = false;
+  detail.error = error;
+  detail.note = note;
+  renderMain();
+}
+
+/** Hand the detail name over to the regular search page. */
+function searchDetailName() {
+  const detail = state.detail;
+  if (!detail) return;
+  const keyword = detailKeyword(detail);
+  state.detail = null;
+  state.keyword = keyword;
+  void doSearch(true);
 }
 
 function clearSearchResults() {
@@ -681,8 +1541,9 @@ function persistLyricPrefs() {
     localStorage.setItem(LYRIC_FONT_KEY, state.lyricFont);
     localStorage.setItem(LYRIC_OFFSET_KEY, String(state.lyricOffsetDefault));
     localStorage.setItem(LYRIC_OFFSET_MAP_KEY, JSON.stringify(state.lyricOffsetMap));
+    localStorage.setItem(LYRIC_TRANSLATION_KEY, state.lyricTranslation ? "1" : "0");
   } catch {
-    /* ignore */
+    /* ignore quota */
   }
 }
 
@@ -696,6 +1557,17 @@ function cycleLyricFont(delta: number) {
   const box = document.querySelector<HTMLElement>(".lyrics");
   if (box) box.dataset.size = next;
   else render();
+}
+
+/** Toggle bilingual subtitles and repaint just the lyric list. */
+function toggleLyricTranslation() {
+  state.lyricTranslation = !state.lyricTranslation;
+  persistLyricPrefs();
+  patchLyricsPanel();
+  // The overlay caches lyrics per track — force a resend with the new layout.
+  desktopLyricsSentUid = "";
+  pushDesktopLyricsState({ immediate: true, full: true });
+  toast(state.lyricTranslation ? "已显示翻译" : "已隐藏翻译");
 }
 
 /** Current track's offset — per-track override when present, otherwise the default. */
@@ -746,6 +1618,12 @@ function goLocalListPage(key: string, delta: number) {
     const pl = browsingPlaylist();
     const total = pl?.tracks.length ?? 0;
     state.browsePage = clampPage(state.browsePage + delta, total, pageSize);
+  } else if (key === "detail" && state.detail) {
+    state.detail.page = clampPage(
+      state.detail.page + delta,
+      state.detail.tracks.length,
+      pageSize,
+    );
   } else {
     return;
   }
@@ -759,6 +1637,9 @@ function syncLocalPagesToSize() {
   state.recentPage = clampPage(state.recentPage, state.recent.length, pageSize);
   const pl = browsingPlaylist();
   state.browsePage = clampPage(state.browsePage, pl?.tracks.length ?? 0, pageSize);
+  if (state.detail) {
+    state.detail.page = clampPage(state.detail.page, state.detail.tracks.length, pageSize);
+  }
 }
 
 let sleepTimeoutId = 0;
@@ -813,7 +1694,7 @@ function setSleepMinutes(minutes: number) {
   sleepTickId = window.setInterval(patchSleepBtn, 1000);
   state.dialog = null;
   toast(`将在 ${minutes} 分钟后暂停`);
-  render();
+  patchOverlays();
 }
 
 function setSleepAfterTrack() {
@@ -821,12 +1702,12 @@ function setSleepAfterTrack() {
   state.sleep = { mode: "track" };
   state.dialog = null;
   toast("本曲结束后暂停");
-  render();
+  patchOverlays();
 }
 
 function openSleepTimerDialog() {
   state.dialog = { kind: "sleep-timer" };
-  render();
+  patchOverlays();
 }
 
 /** Prefer https for remote media (Kuwo often returns http://). */
@@ -888,6 +1769,8 @@ function pushOsMediaTrack() {
     void syncOsMediaTrack(null, false, 0, 0);
     return;
   }
+  // A one-track queue has nothing to skip to — hide those lock-screen buttons.
+  syncOsMediaSkipAvailability(state.queue.length > 1, state.queue.length > 1);
   void syncOsMediaTrack(
     {
       title: t.title,
@@ -912,6 +1795,7 @@ function seekTo(seconds: number) {
 }
 
 async function boot() {
+  applyTheme(state.theme);
   applyPlatformChrome();
   // Kill the default WebView menu (only "Reload") — we show our own on tracks.
   document.addEventListener("contextmenu", (e) => {
@@ -947,6 +1831,7 @@ async function boot() {
     next: () => skip(1),
     previous: () => skip(-1),
     seek: (seconds) => seekTo(seconds),
+    seekBy: (delta) => seekTo(state.position + delta),
   });
   try {
     state.sources = await invoke<SourceInfo[]>("list_sources");
@@ -968,11 +1853,24 @@ async function boot() {
     console.error(e);
   }
   restoreSession();
+  audio.playbackRate = state.playRate;
+  syncOsMediaPlaybackRate(state.playRate);
   window.addEventListener("pagehide", () => writeSessionNow());
+  // Android may kill a backgrounded WebView without firing pagehide.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") writeSessionNow();
+  });
   render();
   void refreshRecommend(false);
   void listenRecommendUpdates();
   void listenDownloadProgress();
+  void listenPlaybackCommands();
+  void listenDesktopLyrics();
+  startKaraokeTicker();
+  if (state.desktopLyrics.visible) {
+    // Re-open silently when the overlay was on before quitting.
+    void setDesktopLyrics(true, { silent: true });
+  }
 
   let resizeTimer = 0;
   let lastListPageSize = calcListPageSize();
@@ -985,11 +1883,34 @@ async function boot() {
       syncLocalPagesToSize();
       if (state.searchTracks.length && state.keyword.trim() && !state.searching && !state.browsePlaylistId) {
         void fetchSearchPage(state.page, false);
-      } else if (state.browsePlaylistId || state.tab === "library" || state.tab === "discover") {
+      } else if (state.browsePlaylistId || state.detail || state.tab === "library" || state.tab === "discover") {
         renderMain();
       }
     }, 280);
   });
+}
+
+/** Tray menu / media keys arrive as events from the Rust side. */
+async function listenPlaybackCommands() {
+  try {
+    await listen<string>("playback-command", (event) => {
+      switch (event.payload) {
+        case "toggle":
+          playPause();
+          break;
+        case "prev":
+          skip(-1);
+          break;
+        case "next":
+          skip(1);
+          break;
+        default:
+          break;
+      }
+    });
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 async function listenRecommendUpdates() {
@@ -1083,8 +2004,18 @@ function clearSearch() {
 }
 
 function toggleLyrics(force?: boolean) {
-  state.lyricsOpen = force ?? !state.lyricsOpen;
-  render();
+  const next = force ?? !state.lyricsOpen;
+  if (next === state.lyricsOpen) return;
+  state.lyricsOpen = next;
+  const shell = app.querySelector(".app-shell");
+  if (!shell) {
+    render();
+    return;
+  }
+  shell.classList.toggle("lyrics-open", next);
+  patchLyricsPanel();
+  patchPlayerDock();
+  afterRenderMotion();
 }
 
 async function invokeSearchPage(page: number, reset: boolean): Promise<SearchPageResult> {
@@ -1262,9 +2193,10 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
   state.current = track;
   state.position = 0;
   state.duration = 0;
-  render();
+  patchPlaybackViews();
 
   try {
+    crossfadeOutCurrent();
     audio.pause();
     // Start silent so the new track fades in instead of cutting in abruptly.
     fadeToken += 1;
@@ -1275,14 +2207,20 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
       toast("暂无可用播放地址");
       state.preparing = false;
       audio.volume = baseVolume();
-      render();
+      patchPlaybackViews();
       return;
     }
     state.current = detailed;
-    state.lyrics = parseLrc(detailed.lrc);
+    state.lyrics = parseLrc(detailed.lrc, {
+      translation: detailed.lrcTranslation,
+      words: detailed.lrcWords,
+    });
+    lyricHasWords = state.lyrics.some((line) => !!line.words?.length);
     lastLyricScrollIdx = -1;
     lyricsUserScrollUntil = 0;
+    pushDesktopLyricsState({ immediate: true, full: true });
     audio.src = toPlayableSrc(preferHttps(detailed.audioUrl));
+    audio.playbackRate = state.playRate;
     if (pendingResume && pendingResume.uid === detailed.uid) {
       applyResumePosition(pendingResume.seconds);
     }
@@ -1305,7 +2243,7 @@ async function playTrack(track: Track, queue?: Track[], queueKind: null | "searc
   } finally {
     if (gen === playGeneration) {
       state.preparing = false;
-      render();
+      patchPlaybackViews();
       pushOsMediaTrack();
     }
   }
@@ -1442,7 +2380,8 @@ async function toggleFavorite(track: Track) {
       calcListPageSize(),
     );
     toast(added ? "已收藏" : "已取消收藏");
-    render();
+    renderMain();
+    patchPlaybackViews();
   } catch (e) {
     toast(String(e));
   }
@@ -1451,7 +2390,7 @@ async function toggleFavorite(track: Track) {
 async function saveSettings(next: AppSettings) {
   state.settings = await invoke<AppSettings>("save_settings", { settings: next });
   toast("设置已保存");
-  render();
+  renderMain();
 }
 
 async function ensureDownloadDirPresets(): Promise<DownloadDirPreset[]> {
@@ -1474,7 +2413,7 @@ async function pickDownloadDir() {
       return;
     }
     state.dialog = { kind: "pick-download-dir", options };
-    render();
+    patchOverlays();
     return;
   }
 
@@ -1497,6 +2436,7 @@ async function pickDownloadDir() {
 
 async function applyDownloadDirPreset(path: string) {
   state.dialog = null;
+  patchOverlays();
   const input = document.querySelector<HTMLInputElement>("#download-dir-input");
   if (input) input.value = path;
   await saveSettings({ ...state.settings, downloadDir: path });
@@ -1506,7 +2446,7 @@ async function reloadSources() {
   try {
     state.sources = await invoke<SourceInfo[]>("list_sources");
     state.settings = await invoke<AppSettings>("get_settings");
-    render();
+    renderMain();
   } catch (e) {
     toast(String(e));
   }
@@ -1572,12 +2512,62 @@ function downloadTrack(track: Track) {
     return;
   }
   state.downloadQueue.push(track);
+  patchDownloadQueueChip();
   if (state.downloadingUid) {
     toast(`已加入下载队列（队列 ${state.downloadQueue.length}）`);
-    render();
     return;
   }
   void drainDownloadQueue();
+}
+
+/** Add many tracks at once, skipping duplicates and local files. */
+function downloadTracks(tracks: Track[]) {
+  const pending = new Set([state.downloadingUid, ...state.downloadQueue.map((t) => t.uid)]);
+  let added = 0;
+  for (const track of tracks) {
+    if (track.source === "local" || pending.has(track.uid)) continue;
+    pending.add(track.uid);
+    state.downloadQueue.push(track);
+    added += 1;
+  }
+  if (!added) {
+    toast("没有可下载的歌曲");
+    return;
+  }
+  toast(`已加入 ${added} 首到下载队列`);
+  patchDownloadQueueChip();
+  if (!state.downloadingUid) void drainDownloadQueue();
+}
+
+/** Resolve a batch-download target from a `data-dl-all` key. */
+function tracksForDownloadKey(key: string): Track[] {
+  if (key === "search") return state.searchTracks;
+  if (key === "detail") return state.detail?.tracks ?? [];
+  if (key === "hot") return state.recommend?.hotTracks ?? [];
+  if (key === "fav") return (state.library?.favorites ?? []).map(storedToTrack);
+  if (key === "recent") return state.recent;
+  if (key.startsWith("rec-")) {
+    const id = key.slice(4);
+    return state.recommend?.hotPlaylists.find((p) => p.id === id)?.tracks ?? [];
+  }
+  if (key.startsWith("pl-")) {
+    const playlist = state.library?.playlists.find((p) => p.id === key.slice(3));
+    return (playlist?.tracks ?? []).map((t) =>
+      storedToTrack(t as LibrarySnapshot["favorites"][number]),
+    );
+  }
+  return [];
+}
+
+function downloadQueueLabel(): string {
+  const pending = state.downloadQueue.length;
+  if (!state.downloadingUid && !pending) return "";
+  return pending ? `下载 · 剩 ${pending}` : "下载中";
+}
+
+/** Shared "download all" button for list headers. */
+function downloadAllButton(key: string, label = "全部下载"): string {
+  return `<button class="btn ghost sm" type="button" data-dl-all="${escapeAttr(key)}">${label}</button>`;
 }
 
 /** Downloads run one at a time — parallel pulls starve playback bandwidth. */
@@ -1586,7 +2576,8 @@ async function drainDownloadQueue() {
     const track = state.downloadQueue.shift()!;
     state.downloadingUid = track.uid;
     delete state.downloadProgress[track.uid];
-    render();
+    patchDownloadBadge(track.uid);
+    patchDownloadQueueChip();
     try {
       const result = await invoke<{ path: string; alreadyExists: boolean }>("download_track", {
         track,
@@ -1601,9 +2592,11 @@ async function drainDownloadQueue() {
     } finally {
       state.downloadingUid = "";
       delete state.downloadProgress[track.uid];
-      render();
+      patchDownloadBadge(track.uid);
+      patchDownloadQueueChip();
     }
   }
+  patchDownloadQueueChip();
 }
 
 /** Short human-readable byte size, e.g. 3.4M. */
@@ -1630,6 +2623,15 @@ function patchDownloadBadge(uid: string) {
     node.textContent = downloadBadgeText(uid);
     node.classList.toggle("is-downloading", state.downloadingUid === uid);
   });
+}
+
+/** Only the queue counter changes on start/finish — repaint that chip alone. */
+function patchDownloadQueueChip() {
+  const chip = document.querySelector("#dl-queue");
+  if (!chip) return;
+  const label = downloadQueueLabel();
+  chip.textContent = label || "下载";
+  chip.classList.toggle("is-active", !!label);
 }
 
 async function listenDownloadProgress() {
@@ -1668,12 +2670,41 @@ async function scanLocalTracks(dir?: string) {
 
 function openNewPlaylistDialog() {
   state.dialog = { kind: "new-playlist" };
-  render();
+  patchOverlays();
 }
 
 function openRenamePlaylistDialog(id: string, name: string) {
   state.dialog = { kind: "rename-playlist", id, name };
-  render();
+  patchOverlays();
+}
+
+function openImportPlaylistDialog() {
+  state.dialog = { kind: "import-playlist", url: "" };
+  patchOverlays();
+}
+
+/** Pull a shared NetEase / QQ playlist into a brand-new local playlist. */
+async function submitImportPlaylist(url: string) {
+  const trimmed = url.trim();
+  if (!trimmed) {
+    toast("请粘贴歌单分享链接");
+    return;
+  }
+  state.dialog = { kind: "import-playlist", url: trimmed, busy: true };
+  patchOverlays();
+  try {
+    const playlist = await invoke<StoredPlaylist>("import_playlist_from_url", { url: trimmed });
+    state.library = await invoke<LibrarySnapshot>("get_library");
+    state.dialog = null;
+    state.libraryPane = "playlists";
+    toast(`已导入「${playlist.name}」，共 ${playlist.tracks.length} 首`);
+    renderMain();
+    patchOverlays();
+  } catch (e) {
+    state.dialog = { kind: "import-playlist", url: trimmed };
+    patchOverlays();
+    toast(`导入失败：${String(e)}`);
+  }
 }
 
 async function submitNewPlaylist(name: string) {
@@ -1687,7 +2718,8 @@ async function submitNewPlaylist(name: string) {
     state.library = await invoke<LibrarySnapshot>("get_library");
     state.dialog = null;
     toast(`已创建「${trimmed}」`);
-    render();
+    renderMain();
+    patchOverlays();
   } catch (e) {
     toast(String(e));
   }
@@ -1704,7 +2736,8 @@ async function submitRenamePlaylist(id: string, name: string) {
     state.library = await invoke<LibrarySnapshot>("get_library");
     state.dialog = null;
     toast(`已重命名为「${trimmed}」`);
-    render();
+    renderMain();
+    patchOverlays();
   } catch (e) {
     toast(String(e));
   }
@@ -1712,7 +2745,7 @@ async function submitRenamePlaylist(id: string, name: string) {
 
 function openDeletePlaylistDialog(id: string, name: string) {
   state.dialog = { kind: "delete-playlist", id, name };
-  render();
+  patchOverlays();
 }
 
 async function confirmDeletePlaylist(id: string) {
@@ -1721,7 +2754,8 @@ async function confirmDeletePlaylist(id: string) {
     state.library = await invoke<LibrarySnapshot>("get_library");
     state.dialog = null;
     toast("歌单已删除");
-    render();
+    renderMain();
+    patchOverlays();
   } catch (e) {
     toast(String(e));
   }
@@ -1733,7 +2767,8 @@ async function removeTrackFromPlaylist(playlistId: string, trackUid: string) {
     state.library = await invoke<LibrarySnapshot>("get_library");
     if (state.contextMenu) state.contextMenu = null;
     toast("已从歌单移除");
-    render();
+    renderMain();
+    patchOverlays();
   } catch (e) {
     toast(String(e));
   }
@@ -1743,7 +2778,7 @@ async function movePlaylistTrack(playlistId: string, fromIndex: number, toIndex:
   try {
     await invoke("move_playlist_track", { playlistId, fromIndex, toIndex });
     state.library = await invoke<LibrarySnapshot>("get_library");
-    render();
+    renderMain();
   } catch (e) {
     toast(String(e));
   }
@@ -1782,7 +2817,7 @@ async function pickLibraryImport() {
     const path = typeof selected === "string" ? selected : null;
     if (!path) return;
     state.dialog = { kind: "import-library", path };
-    render();
+    patchOverlays();
   } catch (e) {
     toast(`选择文件失败：${String(e)}`);
   }
@@ -1795,7 +2830,8 @@ async function confirmImportLibrary(path: string) {
     state.dialog = null;
     state.favPage = 1;
     toast("已导入备份（覆盖本地收藏与歌单）");
-    render();
+    renderMain();
+    patchOverlays();
   } catch (e) {
     toast(`导入失败：${String(e)}`);
   }
@@ -1803,26 +2839,27 @@ async function confirmImportLibrary(path: string) {
 
 function closeDialog() {
   state.dialog = null;
-  render();
+  patchOverlays();
 }
 
 function closeContextMenu() {
   if (!state.contextMenu) return;
   state.contextMenu = null;
-  render();
+  patchOverlays();
 }
 
 function openTrackContextMenu(e: MouseEvent, trackUid: string, queueKey: string) {
   e.preventDefault();
   e.stopPropagation();
   state.contextMenu = { x: e.clientX, y: e.clientY, trackUid, queueKey };
-  render();
+  patchOverlays();
 }
 
 function queueFromKey(key: string): Track[] {
   if (key === "search") {
     return state.searchAccum.length ? state.searchAccum : state.searchTracks;
   }
+  if (key === "detail") return state.detail?.tracks.slice() ?? [];
   if (key === "hot") return state.recommend?.hotTracks ?? [];
   if (key === "fav") return (state.library?.favorites ?? []).map(storedToTrack);
   if (key === "recent") return state.recent.slice();
@@ -1918,7 +2955,7 @@ function removeQueueTrack(uid: string) {
     state.duration = 0;
     writeSessionNow();
     syncQueueDrawer();
-    render();
+    patchPlaybackViews();
     return;
   }
   if (wasCurrent) {
@@ -1980,7 +3017,7 @@ function openAddToPlaylistDialog(trackUid: string) {
     return;
   }
   state.dialog = { kind: "add-to-playlist", trackUid };
-  render();
+  patchOverlays();
 }
 
 async function addTrackToPlaylist(playlistId: string, trackUid: string) {
@@ -1995,7 +3032,8 @@ async function addTrackToPlaylist(playlistId: string, trackUid: string) {
     const name = state.library.playlists.find((p) => p.id === playlistId)?.name || "歌单";
     state.dialog = null;
     toast(`已加入「${name}」`);
-    render();
+    renderMain();
+    patchOverlays();
   } catch (e) {
     toast(String(e));
   }
@@ -2013,6 +3051,26 @@ function renderDialog(): string {
           <div class="dialog-actions">
             <button class="btn ghost sm" type="button" id="dialog-cancel">取消</button>
             <button class="btn sm" type="button" id="dialog-ok">创建</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  if (d.kind === "import-playlist") {
+    return `
+      <div class="dialog-backdrop" id="dialog-backdrop">
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+          <h3 id="dialog-title">导入在线歌单</h3>
+          <p class="dialog-msg">粘贴网易云或 QQ 音乐的歌单分享链接，会新建一个本地歌单。</p>
+          <input id="dialog-input" class="dialog-input" type="text" placeholder="https://music.163.com/playlist?id=…" value="${escapeAttr(
+            d.url,
+          )}" autocomplete="off" ${d.busy ? "disabled" : ""} />
+          <div class="dialog-actions">
+            <button class="btn ghost sm" type="button" id="dialog-cancel" ${
+              d.busy ? "disabled" : ""
+            }>取消</button>
+            <button class="btn sm" type="button" id="dialog-ok" ${d.busy ? "disabled" : ""}>${
+              d.busy ? "导入中…" : "导入"
+            }</button>
           </div>
         </div>
       </div>`;
@@ -2280,6 +3338,7 @@ function findTrack(uid: string): Track | undefined {
   return (
     state.searchTracks.find((t) => t.uid === uid) ||
     state.searchAccum.find((t) => t.uid === uid) ||
+    state.detail?.tracks.find((t) => t.uid === uid) ||
     state.recent.find((t) => t.uid === uid) ||
     state.localTracks.find((t) => t.uid === uid) ||
     state.recommend?.hotTracks.find((t) => t.uid === uid) ||
@@ -2341,13 +3400,25 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0, altCo
       : `<span class="badge">${escapeHtml(SOURCE_LABEL[track.source] || track.source)}</span>`;
   return `
     <button class="track-row ${active ? "active" : ""}" type="button" data-play-uid="${escapeAttr(track.uid)}">
-      <span class="idx">${active && state.playing ? "♪" : idx}</span>
+      <span class="idx" data-idx="${idx}">${active && state.playing ? "♪" : idx}</span>
       <img class="cover" src="${coverPlaceholder()}"${coverAttrs(track)} alt="" loading="lazy" decoding="async" />
       <div class="meta">
         <div class="title">${escapeHtml(track.title || "未知歌曲")}</div>
-        <div class="sub">${escapeHtml(track.album || "单曲")}</div>
+        <div class="sub">${
+          track.album
+            ? `<span class="album-link" data-album="${escapeAttr(track.album)}" data-album-artist="${escapeAttr(
+                track.artist,
+              )}" title="查看专辑">${escapeHtml(track.album)}</span>`
+            : "单曲"
+        }</div>
       </div>
-      <div class="artist-col">${escapeHtml(track.artist || "未知歌手")}</div>
+      <div class="artist-col">${
+        track.artist
+          ? `<span class="artist-link" data-artist="${escapeAttr(track.artist)}" title="查看歌手">${escapeHtml(
+              track.artist,
+            )}</span>`
+          : "未知歌手"
+      }</div>
       ${sourceBadge}
       <div class="row-actions">
         ${plActions}
@@ -2435,7 +3506,55 @@ function trackList(
   `;
 }
 
+function renderDetail(detail: NonNullable<typeof state.detail>): string {
+  const label = detail.kind === "artist" ? "歌手" : "专辑";
+  const sliced = slicePage(detail.tracks, detail.page, calcListPageSize());
+  detail.page = sliced.page;
+  return `
+    <h1 class="page-title">${escapeHtml(detail.name)}<span class="sub">${label}${
+      detail.kind === "album" && detail.artist ? ` · ${escapeHtml(detail.artist)}` : ""
+    } · ${detail.loading ? "加载中…" : `共 ${sliced.total} 首`}</span></h1>
+    ${
+      detail.note
+        ? `<div class="search-error-banner" role="status">${escapeHtml(detail.note)}</div>`
+        : ""
+    }
+    ${
+      detail.error
+        ? `<div class="search-error-banner" role="status">加载失败：${escapeHtml(detail.error)}</div>`
+        : ""
+    }
+    <div class="section">
+      <div class="section-head">
+        <h2>歌曲</h2>
+        <div class="section-actions">
+          ${renderPager({
+            key: "detail",
+            page: sliced.page,
+            totalPages: sliced.totalPages,
+            ariaLabel: `${label}分页`,
+          })}
+          ${detail.tracks.length ? downloadAllButton("detail") : ""}
+          <button class="btn ghost sm" type="button" id="btn-detail-search">在搜索中查看更多</button>
+        </div>
+      </div>
+      ${
+        detail.loading && !detail.tracks.length
+          ? trackSkeleton(6)
+          : detail.tracks.length
+            ? trackList(sliced.items, "detail", sliced.startIndex)
+            : emptyState(
+                "⌕",
+                "没有找到相关歌曲",
+                detail.kind === "artist" ? "试试在搜索中查看更多" : "音源可能没有收录这张专辑",
+              )
+      }
+    </div>
+  `;
+}
+
 function renderDiscover(): string {
+  if (state.detail) return renderDetail(state.detail);
   const playlists = state.recommend?.hotPlaylists ?? [];
   const pageSize = calcListPageSize();
   const browsing = browsingPlaylist();
@@ -2449,12 +3568,15 @@ function renderDiscover(): string {
       <div class="section">
         <div class="section-head">
           <h2>歌曲</h2>
-          ${renderPager({
-            key: "browse",
-            page: sliced.page,
-            totalPages: sliced.totalPages,
-            ariaLabel: "歌单分页",
-          })}
+          <div class="section-actions">
+            ${renderPager({
+              key: "browse",
+              page: sliced.page,
+              totalPages: sliced.totalPages,
+              ariaLabel: "歌单分页",
+            })}
+            ${downloadAllButton(`rec-${browsing.id}`)}
+          </div>
         </div>
         ${trackList(sliced.items, `rec-${browsing.id}`, sliced.startIndex)}
       </div>
@@ -2471,14 +3593,17 @@ function renderDiscover(): string {
       <div class="section">
         <div class="section-head">
           <h2>歌曲</h2>
-          <div class="pager" role="navigation" aria-label="搜索分页">
-            <button class="btn ghost sm" id="btn-search-prev" type="button" ${
-              state.searching || state.page <= 1 ? "disabled" : ""
-            }>上一页</button>
-            <span class="pager-indicator">第 ${state.page} 页</span>
-            <button class="btn ghost sm" id="btn-search-next" type="button" ${
-              state.searching || !state.searchHasMore ? "disabled" : ""
-            }>下一页</button>
+          <div class="section-actions">
+            <div class="pager" role="navigation" aria-label="搜索分页">
+              <button class="btn ghost sm" id="btn-search-prev" type="button" ${
+                state.searching || state.page <= 1 ? "disabled" : ""
+              }>上一页</button>
+              <span class="pager-indicator">第 ${state.page} 页</span>
+              <button class="btn ghost sm" id="btn-search-next" type="button" ${
+                state.searching || !state.searchHasMore ? "disabled" : ""
+              }>下一页</button>
+            </div>
+            ${downloadAllButton("search")}
           </div>
         </div>
         ${
@@ -2535,12 +3660,17 @@ function renderDiscover(): string {
         ${
           refreshing
             ? `<span class="hint">正在拉取最新推荐…</span>`
-            : renderPager({
-                key: "hot",
-                page: hot.page,
-                totalPages: hot.totalPages,
-                ariaLabel: "热门歌曲分页",
-              }) || `<span class="hint">点击即播 · 共 ${hot.total} 首</span>`
+            : `<div class="section-actions">
+                ${
+                  renderPager({
+                    key: "hot",
+                    page: hot.page,
+                    totalPages: hot.totalPages,
+                    ariaLabel: "热门歌曲分页",
+                  }) || `<span class="hint">点击即播 · 共 ${hot.total} 首</span>`
+                }
+                ${hot.items.length ? downloadAllButton("hot") : ""}
+              </div>`
         }
       </div>
       ${refreshing ? trackSkeleton(8) : trackList(hot.items, "hot", hot.startIndex)}
@@ -2616,14 +3746,17 @@ function renderLibrary(): string {
                 favsAll.length
                   ? `<div class="section-head compact">
                       <h2>我喜欢</h2>
-                      ${
-                        renderPager({
-                          key: "fav",
-                          page: favs.page,
-                          totalPages: favs.totalPages,
-                          ariaLabel: "我喜欢分页",
-                        }) || `<span class="hint">共 ${favs.total} 首</span>`
-                      }
+                      <div class="section-actions">
+                        ${
+                          renderPager({
+                            key: "fav",
+                            page: favs.page,
+                            totalPages: favs.totalPages,
+                            ariaLabel: "我喜欢分页",
+                          }) || `<span class="hint">共 ${favs.total} 首</span>`
+                        }
+                        ${downloadAllButton("fav")}
+                      </div>
                     </div>
                     ${trackList(favs.items, "fav", favs.startIndex)}`
                   : emptyState("♡", "还没有收藏", "去发现页点红心，喜欢的歌会出现在这里")
@@ -2645,6 +3778,7 @@ function renderLibrary(): string {
                             }) || `<span class="hint">共 ${recent.total} 首</span>`
                           }
                           <button class="btn ghost sm" id="btn-clear-recent" type="button">清空</button>
+                          ${downloadAllButton("recent")}
                         </div>
                       </div>
                       ${trackList(recent.items, "recent", recent.startIndex)}`
@@ -2678,6 +3812,7 @@ function renderLibrary(): string {
               : `<section class="lib-pane">
               <div class="lib-pane-actions">
                 <button class="btn ghost sm" id="btn-new-playlist" type="button">新建歌单</button>
+                <button class="btn ghost sm" id="btn-import-playlist" type="button">导入在线歌单</button>
               </div>
               ${
                 playlists.length
@@ -2691,6 +3826,7 @@ function renderLibrary(): string {
                           <div class="section-head compact">
                             <h2>${escapeHtml(p.name)} · ${tracks.length}</h2>
                             <div class="section-actions">
+                              ${downloadAllButton(`pl-${p.id}`)}
                               <button class="btn ghost sm" data-rename-playlist="${escapeAttr(p.id)}" type="button">重命名</button>
                               <button class="btn ghost sm" data-del-playlist="${escapeAttr(p.id)}" type="button">删除</button>
                             </div>
@@ -2709,6 +3845,88 @@ function renderLibrary(): string {
       }
     </div>
   `;
+}
+
+function cacheStatsText(): string {
+  const stats = state.cacheStats;
+  if (!stats) return "统计中…";
+  return `封面 ${stats.coverFiles} 个 / ${formatBytes(stats.coverBytes)} · 播放缓存 ${
+    stats.detailsEntries
+  } 条`;
+}
+
+/** Refresh cache occupancy; the settings card shows the result. */
+async function refreshCacheStats() {
+  try {
+    const next = await invoke<CacheStats>("get_cache_stats");
+    state.cacheStats = next;
+  } catch {
+    state.cacheStats = null;
+  }
+  const el = document.querySelector("#cache-stats");
+  if (el) el.textContent = cacheStatsText();
+}
+
+/** Drop backend caches and clear the in-memory cover map so covers reload. */
+async function clearCache() {
+  try {
+    const removed = await invoke<number>("clear_cache");
+    coverMemCache.clear();
+    await refreshCacheStats();
+    toast(`已清理缓存（删除 ${removed} 个封面文件）`);
+    renderMain();
+  } catch (e) {
+    toast(`清理失败：${String(e)}`);
+  }
+}
+
+/** Ask GitHub for the newest release; also used by the settings card. */
+async function checkForUpdate() {
+  if (state.checkingUpdate) return;
+  state.checkingUpdate = true;
+  updateUpdateCard();
+  try {
+    state.updateInfo = await invoke<UpdateInfo>("check_update");
+    if (!state.updateInfo.hasUpdate) toast("已是最新版本");
+  } catch (e) {
+    state.updateInfo = null;
+    toast(`检查更新失败：${String(e)}`);
+  } finally {
+    state.checkingUpdate = false;
+    updateUpdateCard();
+  }
+}
+
+function updateStatusText(): string {
+  const info = state.updateInfo;
+  if (state.checkingUpdate) return "正在检查…";
+  if (!info) return "尚未检查";
+  if (!info.hasUpdate) return `已是最新版本（v${info.current}）`;
+  return `发现新版本 v${info.latest}（当前 v${info.current}）`;
+}
+
+/** The card is a small isolated block — patch it instead of re-rendering the page. */
+function updateUpdateCard() {
+  const text = document.querySelector("#update-status");
+  if (text) text.textContent = updateStatusText();
+  const button = document.querySelector<HTMLButtonElement>("#btn-check-update");
+  if (button) {
+    button.disabled = state.checkingUpdate;
+    button.textContent = state.checkingUpdate ? "检查中…" : "检查更新";
+  }
+  const download = document.querySelector<HTMLButtonElement>("#btn-update-download");
+  if (download) download.hidden = !state.updateInfo?.hasUpdate;
+}
+
+async function openUpdatePage() {
+  const url = state.updateInfo?.url;
+  if (!url) return;
+  try {
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl(url);
+  } catch (e) {
+    toast(`打开下载页失败：${String(e)}`);
+  }
 }
 
 function renderSettings(): string {
@@ -2768,6 +3986,50 @@ function renderSettings(): string {
             : ""
         }
       </div>
+      <div class="settings-card settings-inline">
+        <h3>主题</h3>
+        <button class="btn ghost sm" id="btn-theme-toggle" type="button" aria-pressed="${
+          state.theme === "light"
+        }">${state.theme === "light" ? "浅色" : "深色"}</button>
+      </div>
+      ${
+        isAndroid()
+          ? ""
+          : `<div class="settings-card settings-inline">
+        <h3>桌面歌词</h3>
+        <button class="btn ghost sm" id="btn-desktop-lyrics" type="button" aria-pressed="${
+          state.desktopLyrics.visible
+        }">${state.desktopLyrics.visible ? "已开启" : "关闭"}</button>
+        ${
+          state.desktopLyrics.visible && state.desktopLyrics.locked
+            ? `<button class="btn ghost sm" id="btn-desktop-unlock" type="button">解除锁定</button>`
+            : ""
+        }
+        ${
+          state.desktopLyrics.visible
+            ? `<span class="hint">拖动窗口移动位置 · 点「锁」切换鼠标穿透</span>`
+            : ""
+        }
+      </div>`
+      }
+      <div class="settings-card settings-inline">
+        <h3>缓存占用</h3>
+        <span class="hint" id="cache-stats">${escapeHtml(cacheStatsText())}</span>
+        <button class="btn ghost sm" id="btn-clear-cache" type="button">清理缓存</button>
+      </div>
+      ${eqPanelHtml()}
+      <div class="settings-card">
+        <h3>版本更新</h3>
+        <span class="hint" id="update-status">${escapeHtml(updateStatusText())}</span>
+        <div class="path-row">
+          <button class="btn ghost sm" id="btn-check-update" type="button" ${
+            state.checkingUpdate ? "disabled" : ""
+          }>${state.checkingUpdate ? "检查中…" : "检查更新"}</button>
+          <button class="btn ghost sm" id="btn-update-download" type="button" ${
+            state.updateInfo?.hasUpdate ? "" : "hidden"
+          }>前往下载</button>
+        </div>
+      </div>
       <button class="btn sm" id="btn-save-settings">保存设置</button>
     </div>
   `;
@@ -2802,7 +4064,17 @@ function renderLyricsPanel(): string {
     ? state.lyrics
         .map((line, idx) => {
           const active = idx === activeIdx;
-          return `<button type="button" class="lyric-line${active ? " active-line" : ""}" data-lyric-idx="${idx}" title="跳到这句">${escapeHtml(line.text || " ")}</button>`;
+          const text = escapeHtml(line.text || " ");
+          const body = line.words?.length
+            ? `<span class="lyric-text karaoke" data-karaoke="${idx}">${line.words
+                .map((w, i) => `<span class="kw" data-i="${i}">${escapeHtml(w.text)}</span>`)
+                .join("")}</span>`
+            : `<span class="lyric-text">${text}</span>`;
+          const translation =
+            state.lyricTranslation && line.translation
+              ? `<span class="lyric-tr">${escapeHtml(line.translation)}</span>`
+              : "";
+          return `<button type="button" class="lyric-line${active ? " active-line" : ""}" data-lyric-idx="${idx}" title="跳到这句">${body}${translation}</button>`;
         })
         .join("")
     : emptyState("¶", "暂无歌词", "这首歌没有附带 LRC");
@@ -2818,6 +4090,7 @@ function renderLyricsPanel(): string {
     <div class="lp-tools" role="toolbar" aria-label="歌词设置">
       <button class="btn ghost sm" type="button" id="btn-lyric-font-down" title="缩小歌词">A−</button>
       <button class="btn ghost sm" type="button" id="btn-lyric-font-up" title="放大歌词">A+</button>
+      <button class="btn ghost sm" type="button" id="btn-lyric-tr" aria-pressed="${state.lyricTranslation}" title="显示/隐藏译文">译</button>
       <span class="lp-tools-sep" aria-hidden="true"></span>
       <button class="btn ghost sm" type="button" id="btn-lyric-offset-down" title="歌词提前 0.5 秒">−0.5</button>
       <span class="lp-offset" id="lyric-offset-label" title="本曲歌词时间偏移">${formatLyricOffset(currentLyricOffset())}</span>
@@ -2842,7 +4115,7 @@ function renderTopbarHtml(): string {
   return `
     <div class="topbar">
       ${
-        state.searchTracks.length || state.browsePlaylistId
+        state.searchTracks.length || state.browsePlaylistId || state.detail
           ? `<button class="back-btn" id="btn-clear-search" type="button" title="返回发现" aria-label="返回发现">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M15 18l-6-6 6-6"/>
@@ -2852,29 +4125,16 @@ function renderTopbarHtml(): string {
       }
       <div class="search-row">
         <div class="search-field">
-          <input id="search-input" placeholder="搜索歌曲、歌手" value="${escapeAttr(state.keyword)}" autocomplete="off" />
-          ${
-            state.searchHistoryOpen && loadSearchHistory().length
-              ? `<div class="search-history" id="search-history">
-                  <div class="search-history-head">
-                    <span>搜索历史</span>
-                    <button type="button" class="search-history-clear" id="btn-clear-history">清空</button>
-                  </div>
-                  ${loadSearchHistory()
-                    .map(
-                      (h) => `
-                    <button type="button" class="search-history-item" data-history="${escapeAttr(h)}">
-                      <span class="search-history-text">${escapeHtml(h)}</span>
-                      <span class="search-history-del" data-history-del="${escapeAttr(h)}" title="删除">×</span>
-                    </button>`,
-                    )
-                    .join("")}
-                </div>`
-              : ""
-          }
+          <input id="search-input" placeholder="搜索歌曲、歌手、拼音首字母" value="${escapeAttr(state.keyword)}" autocomplete="off" />
+          <div id="search-suggest">${state.searchHistoryOpen ? searchSuggestHtml() : ""}</div>
         </div>
         <button class="btn sm" id="btn-search" ${state.searching ? "disabled" : ""}>${
           state.searching ? "搜索中…" : "搜索"
+        }</button>
+      </div>
+      <div class="topbar-actions">
+        <button class="mode-btn" id="btn-theme-quick" type="button" title="切换主题" aria-label="切换主题">${
+          state.theme === "light" ? "☾" : "☀"
         }</button>
       </div>
     </div>`;
@@ -2900,37 +4160,10 @@ function renderMain() {
   afterRenderMotion();
 }
 
-function render() {
+function renderPlayerDockHtml(): string {
   const current = state.current;
   const showLyrics = state.lyricsOpen;
-
-  app.innerHTML = `
-    <div class="wallpaper" aria-hidden="true"></div>
-    <div class="app-shell ${showLyrics ? "lyrics-open" : ""}">
-      <aside class="sidebar">
-        <div class="brand-block">
-          <img class="brand-mark" src="${logoUrl}" alt="" width="36" height="36" />
-          <div class="brand-text">
-            <h1 class="brand">猫耳收音机</h1>
-          </div>
-        </div>
-        <nav class="nav">
-          <button data-tab="discover" class="${state.tab === "discover" ? "active" : ""}" type="button">
-            <span class="nav-ico">♪</span><span class="label">发现</span>
-          </button>
-          <button data-tab="library" class="${state.tab === "library" ? "active" : ""}" type="button">
-            <span class="nav-ico">♡</span><span class="label">我的</span>
-          </button>
-          <button data-tab="settings" class="${state.tab === "settings" ? "active" : ""}" type="button">
-            <span class="nav-ico">⚙</span><span class="label">设置</span>
-          </button>
-        </nav>
-      </aside>
-
-      <main class="main">${renderMainColumnHtml()}</main>
-
-      <aside class="lyrics-panel">${renderLyricsPanel()}</aside>
-
+  return `
       <footer class="player-dock">
         ${
           current
@@ -2938,7 +4171,13 @@ function render() {
                 <img class="cover" src="${coverPlaceholder()}"${coverAttrs(current, "full")} alt="" decoding="async" />
                 <div class="meta">
                   <div class="title">${escapeHtml(current.title)}</div>
-                  <div class="sub">${escapeHtml(current.artist)}${state.preparing ? " · 准备中" : ""}</div>
+                  <div class="sub">${
+                    current.artist
+                      ? `<span class="artist-link" data-artist="${escapeAttr(current.artist)}" title="查看歌手">${escapeHtml(
+                          current.artist,
+                        )}</span>`
+                      : "未知歌手"
+                  }${state.preparing ? " · 准备中" : ""}</div>
                 </div>
                 ${favButton(current.uid)}
               </button>`
@@ -2978,24 +4217,124 @@ function render() {
             />
           </div>
           <button class="mode-btn" id="btn-mode-bar" type="button" title="${modeLabel()}">${modeLabelShort()}</button>
+          <button class="mode-btn${state.playRate !== 1 ? " is-active" : ""}" id="btn-rate" type="button" title="播放速度">${playRateLabel(
+            state.playRate,
+          )}</button>
           <button class="mode-btn${state.queueOpen ? " is-active" : ""}" id="btn-queue" type="button" title="播放队列">队列${
             state.queue.length ? ` · ${state.queue.length}` : ""
           }</button>
           <button class="mode-btn${state.sleep ? " is-active" : ""}" id="btn-sleep" type="button" title="${
             state.sleep ? "定时关闭中 · 点击调整" : "定时关闭"
           }">${sleepLabel()}</button>
+          <span class="mode-btn dl-queue${downloadQueueLabel() ? " is-active" : ""}" id="dl-queue" title="下载队列">${
+            downloadQueueLabel() || "下载"
+          }</span>
           <button class="mode-btn" id="toggle-lyrics-2" type="button">${showLyrics ? "收起" : "歌词"}</button>
         </div>
-      </footer>
+      </footer>`;
+}
+
+function render() {
+  const showLyrics = state.lyricsOpen;
+
+  app.innerHTML = `
+    <div class="wallpaper" aria-hidden="true"></div>
+    <div class="app-shell ${showLyrics ? "lyrics-open" : ""}">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <img class="brand-mark" src="${logoUrl}" alt="" width="36" height="36" />
+          <div class="brand-text">
+            <h1 class="brand">猫耳收音机</h1>
+          </div>
+        </div>
+        <nav class="nav">
+          <button data-tab="discover" class="${state.tab === "discover" ? "active" : ""}" type="button">
+            <span class="nav-ico">♪</span><span class="label">发现</span>
+          </button>
+          <button data-tab="library" class="${state.tab === "library" ? "active" : ""}" type="button">
+            <span class="nav-ico">♡</span><span class="label">我的</span>
+          </button>
+          <button data-tab="settings" class="${state.tab === "settings" ? "active" : ""}" type="button">
+            <span class="nav-ico">⚙</span><span class="label">设置</span>
+          </button>
+        </nav>
+      </aside>
+
+      <main class="main">${renderMainColumnHtml()}</main>
+
+      <aside class="lyrics-panel">${renderLyricsPanel()}</aside>
+
+      ${renderPlayerDockHtml()}
     </div>
-    ${renderDialog()}
-    ${renderContextMenu()}
+    <div id="overlay-root">${renderDialog()}${renderContextMenu()}</div>
     <div id="queue-root">${renderQueueDrawer()}</div>
     <div class="toast ${state.toast ? "" : "hidden"}">${escapeHtml(state.toast)}</div>
   `;
 
   bindEvents();
   hydrateCovers();
+  afterRenderMotion();
+}
+
+/** Repaint the player dock in place — the search/library lists stay untouched. */
+function patchPlayerDock() {
+  const dock = app.querySelector<HTMLElement>(".player-dock");
+  if (!dock) {
+    render();
+    return;
+  }
+  dock.outerHTML = renderPlayerDockHtml();
+  bindPlayerEvents();
+  hydrateCovers();
+}
+
+/** Repaint the lyrics panel in place (only exists while lyrics are open). */
+function patchLyricsPanel() {
+  const panel = app.querySelector<HTMLElement>(".lyrics-panel");
+  if (!panel) {
+    render();
+    return;
+  }
+  panel.innerHTML = renderLyricsPanel();
+  bindLyricsEvents();
+  hydrateCovers();
+  lastLyricScrollIdx = -1;
+  syncLyricsHighlight({ forceScroll: true });
+}
+
+/** Re-apply row highlight / playing marker without rebuilding the row HTML. */
+function patchTrackRowActive() {
+  const uid = state.current?.uid || "";
+  document.querySelectorAll<HTMLElement>("[data-play-uid]").forEach((row) => {
+    const active = row.dataset.playUid === uid;
+    row.classList.toggle("active", active);
+    const idx = row.querySelector<HTMLElement>(":scope > .idx");
+    if (!idx) return;
+    idx.textContent = active && state.playing ? "♪" : idx.dataset.idx || "";
+  });
+}
+
+/** Dialog + context menu live in their own root so overlays never reset list scroll. */
+function patchOverlays() {
+  const root = app.querySelector<HTMLElement>("#overlay-root");
+  if (!root) {
+    render();
+    return;
+  }
+  root.innerHTML = `${renderDialog()}${renderContextMenu()}`;
+  bindOverlayEvents();
+}
+
+/**
+ * Cheap playback refresh: dock, lyrics, active row, queue drawer.
+ * Replaces the full `render()` on track switches and download ticks.
+ */
+function patchPlaybackViews() {
+  patchTrackRowActive();
+  patchPlayerDock();
+  if (state.lyricsOpen) patchLyricsPanel();
+  patchQueueBtn();
+  if (state.queueOpen) syncQueueDrawer();
   afterRenderMotion();
 }
 
@@ -3138,44 +4477,37 @@ function bindQueueEvents() {
   patchQueueBtn();
 }
 
-function bindChromeEvents() {
+function bindSidebarEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.tab = btn.dataset.tab as TabId;
       renderMain();
+      if (state.tab === "settings") void refreshCacheStats();
     });
   });
+}
 
+/** Player dock listeners — rebound whenever the dock HTML is replaced. */
+function bindPlayerEvents() {
   document.querySelector("#btn-pp")?.addEventListener("click", () => playPause());
   document.querySelector("#btn-prev")?.addEventListener("click", () => skip(-1));
   document.querySelector("#btn-next")?.addEventListener("click", () => skip(1));
   document.querySelector("#btn-mode-bar")?.addEventListener("click", () => cyclePlayMode());
+  document.querySelector("#btn-rate")?.addEventListener("click", () => cyclePlayRate());
   document.querySelector("#btn-queue")?.addEventListener("click", () => toggleQueueDrawer());
   document.querySelector("#btn-sleep")?.addEventListener("click", () => openSleepTimerDialog());
-  document.querySelector("#btn-fav-np")?.addEventListener("click", () => {
-    if (state.current) void toggleFavorite(state.current);
-  });
-  document.querySelector("#btn-close-lyrics")?.addEventListener("click", () => toggleLyrics(false));
   document.querySelector("#toggle-lyrics-2")?.addEventListener("click", () => toggleLyrics());
-  document.querySelector("#btn-lyric-font-down")?.addEventListener("click", () => cycleLyricFont(-1));
-  document.querySelector("#btn-lyric-font-up")?.addEventListener("click", () => cycleLyricFont(1));
-  document.querySelector("#btn-lyric-offset-down")?.addEventListener("click", () => nudgeLyricOffset(-0.5));
-  document.querySelector("#btn-lyric-offset-up")?.addEventListener("click", () => nudgeLyricOffset(0.5));
-  document.querySelectorAll<HTMLElement>("[data-lyric-idx]").forEach((el) => {
-    el.addEventListener("click", () => {
-      const idx = Number(el.dataset.lyricIdx);
-      const line = state.lyrics[idx];
-      if (!line) return;
-      lyricsUserScrollUntil = 0;
-      lastLyricScrollIdx = -1;
-      seekTo(line.time);
-      syncLyricsHighlight({ forceScroll: true });
-    });
-  });
 
   const playerNow = document.querySelector("#toggle-lyrics");
   playerNow?.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
+    if (target.closest("[data-artist]")) {
+      e.preventDefault();
+      e.stopPropagation();
+      const el = target.closest("[data-artist]") as HTMLElement;
+      openDetail("artist", el.dataset.artist || "");
+      return;
+    }
     if (target.closest("[data-fav-uid]")) {
       e.preventDefault();
       e.stopPropagation();
@@ -3206,6 +4538,36 @@ function bindChromeEvents() {
   });
 }
 
+/** Lyrics panel listeners — rebound whenever the panel HTML is replaced. */
+function bindLyricsEvents() {
+  document.querySelector("#btn-fav-np")?.addEventListener("click", () => {
+    if (state.current) void toggleFavorite(state.current);
+  });
+  document.querySelector("#btn-close-lyrics")?.addEventListener("click", () => toggleLyrics(false));
+  document.querySelector("#btn-lyric-font-down")?.addEventListener("click", () => cycleLyricFont(-1));
+  document.querySelector("#btn-lyric-font-up")?.addEventListener("click", () => cycleLyricFont(1));
+  document.querySelector("#btn-lyric-tr")?.addEventListener("click", () => toggleLyricTranslation());
+  document.querySelector("#btn-lyric-offset-down")?.addEventListener("click", () => nudgeLyricOffset(-0.5));
+  document.querySelector("#btn-lyric-offset-up")?.addEventListener("click", () => nudgeLyricOffset(0.5));
+  document.querySelectorAll<HTMLElement>("[data-lyric-idx]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const idx = Number(el.dataset.lyricIdx);
+      const line = state.lyrics[idx];
+      if (!line) return;
+      lyricsUserScrollUntil = 0;
+      lastLyricScrollIdx = -1;
+      seekTo(line.time);
+      syncLyricsHighlight({ forceScroll: true });
+    });
+  });
+}
+
+function bindChromeEvents() {
+  bindSidebarEvents();
+  bindPlayerEvents();
+  bindLyricsEvents();
+}
+
 function bindMainEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-lib-pane]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -3229,58 +4591,39 @@ function bindMainEvents() {
   const searchInput = document.querySelector<HTMLInputElement>("#search-input");
   searchInput?.addEventListener("input", () => {
     state.keyword = searchInput.value;
+    // Typing turns the dropdown into instant local matches; patch in place so
+    // the caret does not jump.
+    if (!state.searchHistoryOpen) {
+      state.searchHistoryOpen = true;
+      attachSearchHistoryDocHandler();
+    }
+    patchSearchSuggest();
   });
   searchInput?.addEventListener("focus", () => {
-    if (!loadSearchHistory().length || state.searchHistoryOpen) return;
+    // The dropdown is worth opening even with no history — it now also
+    // carries hot keywords.
+    if (state.searchHistoryOpen) return;
     state.searchHistoryOpen = true;
-    renderMain();
-    document.querySelector<HTMLInputElement>("#search-input")?.focus();
+    attachSearchHistoryDocHandler();
+    patchSearchSuggest();
   });
   searchInput?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") void doSearch(true);
     if (e.key === "Escape" && state.searchHistoryOpen) {
       state.searchHistoryOpen = false;
       detachSearchHistoryDocHandler();
-      renderMain();
+      patchSearchSuggest();
     }
   });
   if (state.searchHistoryOpen) {
     attachSearchHistoryDocHandler();
+    bindSearchSuggestEvents();
   } else {
     detachSearchHistoryDocHandler();
   }
-  document.querySelector("#btn-clear-history")?.addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    clearSearchHistory();
-    state.searchHistoryOpen = false;
-    detachSearchHistoryDocHandler();
-    renderMain();
-  });
-  document.querySelectorAll<HTMLElement>("[data-history]").forEach((el) => {
-    el.addEventListener("mousedown", (e) => e.preventDefault());
-    el.addEventListener("click", (e) => {
-      const del = (e.target as HTMLElement).closest("[data-history-del]") as HTMLElement | null;
-      if (del) {
-        e.preventDefault();
-        e.stopPropagation();
-        removeSearchHistory(del.dataset.historyDel || "");
-        if (!loadSearchHistory().length) {
-          state.searchHistoryOpen = false;
-          detachSearchHistoryDocHandler();
-        }
-        renderMain();
-        if (state.searchHistoryOpen) {
-          document.querySelector<HTMLInputElement>("#search-input")?.focus();
-        }
-        return;
-      }
-      const kw = el.dataset.history || "";
-      state.keyword = kw;
-      void doSearch(true);
-    });
-  });
   document.querySelector("#btn-search")?.addEventListener("click", () => void doSearch(true));
+  document.querySelector("#btn-detail-search")?.addEventListener("click", () => searchDetailName());
+  document.querySelector("#btn-theme-quick")?.addEventListener("click", () => toggleTheme());
   document.querySelector("#btn-clear-search")?.addEventListener("click", () => clearSearch());
   document.querySelector("#btn-search-prev")?.addEventListener("click", () => void goSearchPage(-1));
   document.querySelector("#btn-search-next")?.addEventListener("click", () => void goSearchPage(1));
@@ -3303,6 +4646,20 @@ function bindMainEvents() {
         return;
       }
       const target = e.target as HTMLElement;
+      if (target.closest("[data-artist]")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const el = target.closest("[data-artist]") as HTMLElement;
+        openDetail("artist", el.dataset.artist || "");
+        return;
+      }
+      if (target.closest("[data-album]")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const el = target.closest("[data-album]") as HTMLElement;
+        openDetail("album", el.dataset.album || "", el.dataset.albumArtist || "");
+        return;
+      }
       if (target.closest("[data-group-toggle]")) {
         e.preventDefault();
         e.stopPropagation();
@@ -3379,7 +4736,22 @@ function bindMainEvents() {
     });
   });
 
+  document.querySelectorAll<HTMLElement>("[data-dl-all]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.dlAll || "";
+      const tracks = tracksForDownloadKey(key);
+      if (!tracks.length) {
+        toast("当前列表没有可下载的歌曲");
+        return;
+      }
+      downloadTracks(tracks);
+    });
+  });
+
   document.querySelector("#btn-new-playlist")?.addEventListener("click", () => openNewPlaylistDialog());
+  document.querySelector("#btn-import-playlist")?.addEventListener("click", () => {
+    openImportPlaylistDialog();
+  });
   document.querySelector("#btn-export-library")?.addEventListener("click", () => {
     void exportLibraryBackup();
   });
@@ -3414,6 +4786,30 @@ function bindMainEvents() {
     void importSourceFromFile();
   });
 
+  document.querySelector("#btn-clear-cache")?.addEventListener("click", () => void clearCache());
+  document.querySelector("#btn-eq-toggle")?.addEventListener("click", () => void toggleEq());
+  document.querySelectorAll<HTMLElement>("[data-eq-preset]").forEach((btn) => {
+    btn.addEventListener("click", () => applyEqPreset(btn.dataset.eqPreset || "flat"));
+  });
+  document.querySelectorAll<HTMLInputElement>("[data-eq-band]").forEach((slider) => {
+    slider.addEventListener("input", () => {
+      setEqBand(Number(slider.dataset.eqBand), Number(slider.value));
+    });
+  });
+  document.querySelector("#eq-preamp")?.addEventListener("input", (e) => {
+    setEqPreampValue(Number((e.target as HTMLInputElement).value));
+  });
+  document.querySelector("#btn-check-update")?.addEventListener("click", () => void checkForUpdate());
+  document
+    .querySelector("#btn-update-download")
+    ?.addEventListener("click", () => void openUpdatePage());
+  document.querySelector("#btn-theme-toggle")?.addEventListener("click", () => toggleTheme());
+  document
+    .querySelector("#btn-desktop-lyrics")
+    ?.addEventListener("click", () => toggleDesktopLyrics());
+  document
+    .querySelector("#btn-desktop-unlock")
+    ?.addEventListener("click", () => void unlockDesktopLyrics());
   document.querySelector("#btn-save-settings")?.addEventListener("click", () => {
     const enabled = Array.from(
       document.querySelectorAll<HTMLInputElement>("[data-source-toggle]:checked"),
@@ -3455,16 +4851,16 @@ function bindOverlayEvents() {
       const action = btn.dataset.ctx;
       state.contextMenu = null;
       if (!track || !action) {
-        render();
+        patchOverlays();
         return;
       }
       if (action === "play") {
         void playTrack(track, queueFromKey(menu.queueKey), queueKindFor(menu.queueKey));
-        render();
+        patchOverlays();
         return;
       }
       if (action === "add-pl") {
-        render();
+        patchOverlays();
         openAddToPlaylistDialog(track.uid);
         return;
       }
@@ -3474,7 +4870,7 @@ function bindOverlayEvents() {
           void removeTrackFromPlaylist(playlistId, track.uid);
           return;
         }
-        render();
+        patchOverlays();
         return;
       }
       if (action === "fav") {
@@ -3483,10 +4879,10 @@ function bindOverlayEvents() {
       }
       if (action === "download") {
         void downloadTrack(track);
-        render();
+        patchOverlays();
         return;
       }
-      render();
+      patchOverlays();
     });
   });
 
@@ -3500,6 +4896,8 @@ function bindOverlayEvents() {
     if (!d) return;
     if (d.kind === "new-playlist") {
       void submitNewPlaylist(dialogInput?.value || "");
+    } else if (d.kind === "import-playlist") {
+      void submitImportPlaylist(dialogInput?.value || "");
     } else if (d.kind === "rename-playlist") {
       void submitRenamePlaylist(d.id, dialogInput?.value || "");
     } else if (d.kind === "delete-playlist") {
@@ -3528,7 +4926,7 @@ function bindOverlayEvents() {
       if (v === "off") {
         clearSleepTimer();
         state.dialog = null;
-        render();
+        patchOverlays();
         return;
       }
       if (v === "track") {
@@ -3544,6 +4942,7 @@ function bindOverlayEvents() {
     if (e.key === "Enter") {
       if (d?.kind === "rename-playlist") void submitRenamePlaylist(d.id, dialogInput.value);
       else if (d?.kind === "new-playlist") void submitNewPlaylist(dialogInput.value);
+      else if (d?.kind === "import-playlist") void submitImportPlaylist(dialogInput.value);
     }
     if (e.key === "Escape") closeDialog();
   });
@@ -3552,6 +4951,9 @@ function bindOverlayEvents() {
     dialogInput.select();
   }
 }
+
+/** Whether the loaded lyrics carry word timings — decided once per track. */
+let lyricHasWords = false;
 
 /** Last lyric index we scrolled to — avoid smooth-scroll spam on every timeupdate. */
 let lastLyricScrollIdx = -1;
@@ -3589,6 +4991,28 @@ function bindLyricsScrollGuard(container: Element) {
   );
 }
 
+/**
+ * Karaoke fill for word-timed lines: sung words are fully opaque, the word
+ * currently being sung fades in proportionally to its elapsed share.
+ */
+function paintKaraoke(lyrics: Element, activeIdx: number, position = state.position) {
+  const line = state.lyrics[activeIdx];
+  if (!line?.words?.length) return;
+  const host = lyrics.querySelector<HTMLElement>(`[data-karaoke="${activeIdx}"]`);
+  if (!host) return;
+  const at = position - currentLyricOffset();
+  const spans = host.querySelectorAll<HTMLElement>(".kw");
+  spans.forEach((span, i) => {
+    const word = line.words?.[i];
+    if (!word) return;
+    const progress = at <= word.time ? 0 : at >= word.end ? 1 : (at - word.time) / (word.end - word.time);
+    span.classList.toggle("sung", progress >= 1);
+    // Only the word in flight needs a numeric value.
+    const style = span.style;
+    style.opacity = progress > 0 && progress < 1 ? String(0.3 + 0.7 * progress) : "";
+  });
+}
+
 function syncLyricsHighlight(opts?: { forceScroll?: boolean }) {
   const lyrics = document.querySelector(".lyrics");
   if (!lyrics || !state.lyrics.length) return;
@@ -3599,6 +5023,7 @@ function syncLyricsHighlight(opts?: { forceScroll?: boolean }) {
   state.lyrics.forEach((_, idx) => {
     lines[idx]?.classList.toggle("active-line", idx === activeIdx);
   });
+  if (activeIdx >= 0) paintKaraoke(lyrics, activeIdx);
 
   if (activeIdx < 0) return;
   const force = opts?.forceScroll === true;
@@ -3633,9 +5058,23 @@ function patchPlayerChrome() {
     seek.value = String(state.position);
   }
   syncLyricsHighlight();
+  pushDesktopLyricsState();
 }
 
 let lastOsPosAt = 0;
+
+/** Word-level karaoke needs sub-second frames; `timeupdate` fires only ~4/s. */
+function startKaraokeTicker() {
+  const step = () => {
+    if (lyricHasWords && state.playing && state.lyricsOpen) {
+      const lyrics = document.querySelector(".lyrics");
+      const activeIdx = activeLyricIndex(audio.currentTime);
+      if (lyrics && activeIdx >= 0) paintKaraoke(lyrics, activeIdx, audio.currentTime);
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
 
 audio.addEventListener("timeupdate", () => {
   state.position = audio.currentTime;
@@ -3659,11 +5098,14 @@ function bouncePlayButton() {
 
 audio.addEventListener("play", () => {
   state.playing = true;
+  void maybeAttachEq();
   const btn = document.querySelector("#btn-pp");
   if (btn) btn.textContent = "⏸";
   bouncePlayButton();
+  patchTrackRowActive();
   syncOsMediaPlaybackState(true);
   pushOsMediaTrack();
+  pushDesktopLyricsState({ immediate: true });
 });
 
 audio.addEventListener("pause", () => {
@@ -3671,8 +5113,10 @@ audio.addEventListener("pause", () => {
   const btn = document.querySelector("#btn-pp");
   if (btn) btn.textContent = "▶";
   bouncePlayButton();
+  patchTrackRowActive();
   syncOsMediaPlaybackState(false);
   writeSessionNow();
+  pushDesktopLyricsState({ immediate: true });
 });
 
 audio.addEventListener("ended", () => {

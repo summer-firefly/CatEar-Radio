@@ -7,6 +7,8 @@ export type OsMediaHandlers = {
   next: () => void;
   previous: () => void;
   seek: (seconds: number) => void;
+  /** Relative seek for headset / lock-screen rewind & forward buttons. */
+  seekBy: (delta: number) => void;
 };
 
 export type OsMediaTrack = {
@@ -40,6 +42,11 @@ let webReady = false;
 let nativeListener: PluginListener | null = null;
 let nativeReady = false;
 let lastNativeKey = "";
+/** Mirrors the player's speed so lock screens show a sane progress timeline. */
+let playbackRate = 1;
+/** Whether prev/next actually do something for the current queue. */
+let canPrev = true;
+let canNext = true;
 
 function preferHttps(url: string): string {
   if (url.startsWith("http://")) return `https://${url.slice("http://".length)}`;
@@ -57,31 +64,41 @@ function isAndroidHost(): boolean {
   );
 }
 
+type WebAction = [MediaSessionAction, MediaSessionActionHandler | null];
+
+/**
+ * Absolute seek actions share one shape; the OS also offers relative
+ * rewind/forward (headset double-click, lock screen ±15s).
+ */
+function relativeSeek(details: MediaSessionActionDetails, fallback: number) {
+  const offset = typeof details.seekOffset === "number" ? details.seekOffset : fallback;
+  if (!Number.isFinite(offset)) return;
+  handlers?.seekBy(offset);
+}
+
 function applyWebActionHandlers() {
   if (!hasWebMediaSession() || !handlers) return;
   const ms = navigator.mediaSession;
-  const map: Array<[MediaSessionAction, () => void]> = [
+
+  const seekto: MediaSessionActionHandler = (details) => {
+    if (details.seekTime != null) handlers?.seek(details.seekTime);
+  };
+  const backward: MediaSessionActionHandler = (details) => relativeSeek(details, -15);
+  const forward: MediaSessionActionHandler = (details) => relativeSeek(details, 15);
+
+  const map: WebAction[] = [
     ["play", () => handlers?.play()],
     ["pause", () => handlers?.pause()],
     ["stop", () => handlers?.stop()],
-    ["previoustrack", () => handlers?.previous()],
-    ["nexttrack", () => handlers?.next()],
-    [
-      "seekto",
-      () => {
-        /* handled below with details */
-      },
-    ],
+    ["previoustrack", canPrev ? () => handlers?.previous() : null],
+    ["nexttrack", canNext ? () => handlers?.next() : null],
+    ["seekto", seekto],
+    ["seekbackward", backward],
+    ["seekforward", forward],
   ];
   for (const [action, fn] of map) {
     try {
-      if (action === "seekto") {
-        ms.setActionHandler("seekto", (details) => {
-          if (details.seekTime != null) handlers?.seek(details.seekTime);
-        });
-      } else {
-        ms.setActionHandler(action, fn);
-      }
+      ms.setActionHandler(action, fn);
     } catch {
       // Some WebViews reject unsupported actions.
     }
@@ -195,7 +212,7 @@ export async function syncOsMediaTrack(
       if (Number.isFinite(duration) && duration > 0) {
         navigator.mediaSession.setPositionState?.({
           duration,
-          playbackRate: 1,
+          playbackRate,
           position: Math.min(Math.max(0, position), duration),
         });
       }
@@ -214,9 +231,10 @@ export async function syncOsMediaTrack(
       artworkUrl: artwork || undefined,
       duration: Number.isFinite(duration) ? duration : 0,
       position: Number.isFinite(position) ? position : 0,
+      playbackSpeed: playbackRate,
       isPlaying: playing,
-      canPrev: true,
-      canNext: true,
+      canPrev,
+      canNext,
       canSeek: true,
     });
   } else {
@@ -247,7 +265,7 @@ export function syncOsMediaPosition(position: number, duration: number) {
       if (Number.isFinite(duration) && duration > 0) {
         navigator.mediaSession.setPositionState?.({
           duration,
-          playbackRate: 1,
+          playbackRate,
           position: Math.min(Math.max(0, position), duration),
         });
       }
@@ -256,6 +274,43 @@ export function syncOsMediaPosition(position: number, duration: number) {
     }
   }
   void nativeUpdateTimeline(position, duration);
+}
+
+/** Keep the OS timeline in step with the player's speed (0.75×–2×). */
+export function syncOsMediaPlaybackRate(rate: number, position = 0, duration = 0) {
+  const next = Number.isFinite(rate) && rate > 0 ? rate : 1;
+  if (next === playbackRate) return;
+  playbackRate = next;
+  if (hasWebMediaSession() && Number.isFinite(duration) && duration > 0) {
+    try {
+      navigator.mediaSession.setPositionState?.({
+        duration,
+        playbackRate,
+        position: Math.min(Math.max(0, position), duration),
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+  if (isAndroidHost() && nativeReady) {
+    void invoke("plugin:media-session|update_timeline", { playbackSpeed: playbackRate }).catch(
+      () => undefined,
+    );
+  }
+}
+
+/**
+ * Queue-aware prev/next availability — lock screens otherwise offer buttons
+ * that silently do nothing for single-track or single-mode playback.
+ */
+export function syncOsMediaSkipAvailability(prev: boolean, next: boolean) {
+  if (prev === canPrev && next === canNext) return;
+  canPrev = prev;
+  canNext = next;
+  applyWebActionHandlers();
+  if (isAndroidHost() && nativeReady) {
+    void nativeUpdateState({ canPrev, canNext });
+  }
 }
 
 export function isOsMediaWebReady() {
