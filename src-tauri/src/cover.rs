@@ -133,8 +133,89 @@ pub async fn fetch_and_cache(
         return Err("空封面".into());
     }
     let _ = write_atomic(&cache_path(dir, url, variant), &bytes);
+    maybe_enforce_limit(dir);
     let ext = sniff_ext(&bytes);
     Ok((bytes, ext))
+}
+
+/// A full folder scan on every cover write would be wasteful, so the budget is
+/// checked periodically instead.
+fn maybe_enforce_limit(dir: &Path) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+    if !WRITES.fetch_add(1, Ordering::Relaxed).is_multiple_of(32) {
+        return;
+    }
+    enforce_limit(dir);
+}
+
+/// Caps the on-disk cover folder. Covers are re-downloadable, so old files are
+/// simply dropped once the folder grows past this.
+const COVER_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverCacheStats {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+fn cache_files(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("img") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((path, meta.len(), meta.modified().ok()?))
+        })
+        .collect()
+}
+
+pub fn cache_stats(dir: &Path) -> CoverCacheStats {
+    let files = cache_files(dir);
+    CoverCacheStats {
+        files: files.len(),
+        bytes: files.iter().map(|(_, len, _)| len).sum(),
+    }
+}
+
+/// Remove every cached cover. Returns how many files were deleted.
+pub fn clear_cache(dir: &Path) -> usize {
+    let mut removed = 0;
+    for (path, _, _) in cache_files(dir) {
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Drop the least-recently-written covers until the folder fits the budget.
+fn enforce_limit(dir: &Path) {
+    let mut files = cache_files(dir);
+    let mut total: u64 = files.iter().map(|(_, len, _)| len).sum();
+    if total <= COVER_CACHE_MAX_BYTES {
+        return;
+    }
+    // Oldest first — mtime is a good enough proxy for "not shown recently".
+    files.sort_by_key(|(_, _, modified)| *modified);
+    for (path, len, _) in files {
+        if total <= COVER_CACHE_MAX_BYTES {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -91,6 +91,14 @@ export interface SourceInfo {
   label: string;
 }
 
+/** Backend cache occupancy, mirrored by `get_cache_stats`. */
+export interface CacheStats {
+  searchEntries: number;
+  detailsEntries: number;
+  coverFiles: number;
+  coverBytes: number;
+}
+
 export type TabId = "discover" | "library" | "settings";
 export type PlayMode = "list" | "single" | "shuffle";
 

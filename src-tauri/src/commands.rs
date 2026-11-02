@@ -663,6 +663,35 @@ pub fn scan_local_tracks(
     Ok(tracks)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStats {
+    pub search_entries: usize,
+    pub details_entries: usize,
+    pub cover_files: usize,
+    pub cover_bytes: u64,
+}
+
+/// What the caches currently hold — shown in the settings page.
+#[tauri::command]
+pub fn get_cache_stats(state: State<'_, AppState>) -> CacheStats {
+    let memory = state.music.stats();
+    let covers = crate::cover::cache_stats(&state.cover_dir);
+    CacheStats {
+        search_entries: memory.search_entries,
+        details_entries: memory.details_entries,
+        cover_files: covers.files,
+        cover_bytes: covers.bytes,
+    }
+}
+
+/// Empty the in-memory search/play-URL caches plus the on-disk cover folder.
+#[tauri::command]
+pub fn clear_cache(state: State<'_, AppState>) -> usize {
+    state.music.clear();
+    crate::cover::clear_cache(&state.cover_dir)
+}
+
 /// Fetch a cover through the on-disk cache and return it as a data URL.
 ///
 /// Going through Rust means the WKWebView never sees the slow CDN directly:
