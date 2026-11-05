@@ -71,32 +71,33 @@ impl KuwoMusicSource {
         track: Track,
         quality: AudioQuality,
     ) -> Result<Track, String> {
-        let n = track.display_index.max(1);
         let mut out = track;
-        // br=1 returns flac (often fails in WKWebView), br=320 mp3.
-        // Lossless asks for flac first and falls back to mp3 when the API has none.
-        let candidates: &[u32] = match quality {
-            AudioQuality::Lossless => &[1, 320],
-            AudioQuality::Hq => &[320],
-            AudioQuality::Standard => &[320],
-        };
-        let mut payload: Option<Map<String, Value>> = None;
-        for br in candidates {
-            let url = format!(
-                "{}?msg={}&n={n}&br={br}",
-                self.base_url,
-                urlencoding::encode(&out.keyword)
-            );
-            let Ok(body) = get_text(&url).await else {
-                continue;
-            };
-            let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&body) else {
-                continue;
-            };
-            if let Some(Value::Object(d)) = root.get("data") {
-                if d.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some() {
-                    payload = Some(d.clone());
-                    break;
+        // The oiapi detail endpoint is positional (`msg` search + `n`-th hit), so a
+        // stored favourite resolves to whatever song now sits at that rank — that
+        // is how clicking one track could start another. Confirm the rid first.
+        let wanted = normalize_kuwo_music_id(&out.song_id);
+
+        let mut payload = self
+            .fetch_payload(&out.keyword, out.display_index.max(1), quality)
+            .await
+            .filter(|d| rid_matches(wanted.as_deref(), d));
+
+        if payload.is_none() {
+            if let Some(rid) = wanted.as_deref() {
+                for msg in [format!("{} {}", out.title, out.artist), out.title.clone()] {
+                    if msg.trim().is_empty() {
+                        continue;
+                    }
+                    let Some(rank) = self.find_rank_by_rid(&msg, rid).await else {
+                        continue;
+                    };
+                    payload = self
+                        .fetch_payload(&msg, rank, quality)
+                        .await
+                        .filter(|d| rid_matches(Some(rid), d));
+                    if payload.is_some() {
+                        break;
+                    }
                 }
             }
         }
@@ -130,6 +131,17 @@ impl KuwoMusicSource {
                 quality_label,
                 ..out
             };
+        } else if out.audio_url.as_deref().unwrap_or("").is_empty() {
+            // Nothing could be confirmed, but Kuwo's anti-server resolves strictly
+            // by rid — playing the right song at a lower bitrate beats the wrong one.
+            if let Some(rid) = wanted.as_deref() {
+                if let Some(url) = fetch_rid_url(rid).await {
+                    let (quality_id, quality_label) = infer_quality_from_url(Some(&url));
+                    out.audio_url = Some(url);
+                    out.quality = quality_id;
+                    out.quality_label = quality_label;
+                }
+            }
         }
 
         // oiapi detail often has no lyrics; always try Kuwo open API by musicId.
@@ -144,6 +156,97 @@ impl KuwoMusicSource {
         out.details_loaded = true;
         Ok(out)
     }
+
+    /// Detail lookup by search term and 1-based rank, preferring the requested
+    /// quality. Returns the payload only when it actually carries an audio URL.
+    async fn fetch_payload(
+        &self,
+        msg: &str,
+        rank: i32,
+        quality: AudioQuality,
+    ) -> Option<Map<String, Value>> {
+        // br=1 returns flac (often fails in WKWebView), br=320 mp3.
+        // Lossless asks for flac first and falls back to mp3 when the API has none.
+        let candidates: &[u32] = match quality {
+            AudioQuality::Lossless => &[1, 320],
+            AudioQuality::Hq => &[320],
+            AudioQuality::Standard => &[320],
+        };
+        for br in candidates {
+            let url = format!(
+                "{}?msg={}&n={rank}&br={br}",
+                self.base_url,
+                urlencoding::encode(msg)
+            );
+            let Ok(body) = get_text(&url).await else {
+                continue;
+            };
+            let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&body) else {
+                continue;
+            };
+            if let Some(Value::Object(d)) = root.get("data") {
+                if d.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some() {
+                    return Some(d.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// 1-based rank of the result carrying `rid`, so a title search can address
+    /// one specific song instead of guessing by position.
+    async fn find_rank_by_rid(&self, msg: &str, rid: &str) -> Option<i32> {
+        let url = format!(
+            "{}?msg={}&page=1&limit=20",
+            self.base_url,
+            urlencoding::encode(msg)
+        );
+        let body = get_text(&url).await.ok()?;
+        let Value::Object(root) = serde_json::from_str::<Value>(&body).ok()? else {
+            return None;
+        };
+        let Value::Array(data) = root.get("data")? else {
+            return None;
+        };
+        data.iter()
+            .position(|item| {
+                item.get("rid")
+                    .and_then(|v| v.as_str())
+                    .and_then(normalize_kuwo_music_id)
+                    .is_some_and(|r| r == rid)
+            })
+            .map(|i| i as i32 + 1)
+    }
+}
+
+/// The rid a detail payload belongs to, normalized the same way as stored ids.
+fn payload_rid(d: &Map<String, Value>) -> Option<String> {
+    d.get("rid")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_kuwo_music_id)
+        .or_else(|| d.get("id").and_then(|v| v.as_u64()).map(|n| n.to_string()))
+}
+
+/// Treat a payload as the requested song; unverifiable ones keep old behaviour.
+fn rid_matches(wanted: Option<&str>, d: &Map<String, Value>) -> bool {
+    match wanted {
+        None => true,
+        Some(rid) => payload_rid(d).is_some_and(|r| r == rid),
+    }
+}
+
+/// Exact rid → direct URL, used when no positional lookup could be confirmed.
+async fn fetch_rid_url(rid: &str) -> Option<String> {
+    let url = format!(
+        "https://antiserver.kuwo.cn/anti.s?type=convert_url3&rid=MUSIC_{}&response=url",
+        urlencoding::encode(rid)
+    );
+    let body = get_text(&url).await.ok()?;
+    let Value::Object(root) = serde_json::from_str::<Value>(&body).ok()? else {
+        return None;
+    };
+    let url = root.get("url").and_then(|v| v.as_str())?.trim();
+    (!url.is_empty()).then(|| url.to_string())
 }
 
 fn normalize_kuwo_music_id(song_id: &str) -> Option<String> {
