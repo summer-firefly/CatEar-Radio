@@ -104,26 +104,68 @@ function parseWordLines(raw: string): LyricLine[] {
   return out.sort((a, b) => a.time - b.time);
 }
 
+/**
+ * Split one timed row into one row per phrase, cutting at word boundaries when
+ * karaoke timings exist. Returns null when the phrase text does not line up with
+ * the words, so callers can fall back instead of guessing at timings.
+ */
+function splitByWords(line: LyricLine, phrases: string[]): LyricLine[] | null {
+  const words = line.words;
+  if (!words?.length) return null;
+
+  // Character offsets are whitespace-insensitive: word text and the joined line
+  // text can differ only in spacing.
+  const bounds: number[] = [];
+  let acc = 0;
+  for (const w of words) bounds.push((acc += w.text.replace(/\s+/g, "").length));
+
+  const rows: LyricLine[] = [];
+  let from = 0;
+  let budget = 0;
+  for (const phrase of phrases) {
+    budget += phrase.replace(/\s+/g, "").length;
+    let to = from;
+    while (to < bounds.length && bounds[to] !== budget) to++;
+    // The phrase end must land exactly on a word end, or karaoke would drift.
+    if (to >= bounds.length) return null;
+    // Drop whitespace-only pieces so a row never starts with a stray gap.
+    const chunk = words.slice(from, to + 1).filter((w) => w.text.trim() !== "");
+    if (chunk.length) rows.push({ time: chunk[0].time, text: phrase, words: chunk });
+    from = to + 1;
+  }
+  return from === words.length ? rows : null;
+}
+
 /** One Chinese phrase per row; spread times across the gap to the next stamp. */
-function expandTimedPhrases(raw: LyricLine[]): LyricLine[] {
+function splitPhrases(lines: LyricLine[]): LyricLine[] {
   const out: LyricLine[] = [];
-  for (let i = 0; i < raw.length; i++) {
-    const phrases = expandPhraseText(raw[i].text);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const phrases = expandPhraseText(line.text);
     if (phrases.length <= 1) {
-      out.push({ time: raw[i].time, text: phrases[0] || raw[i].text });
+      out.push({ ...line, text: phrases[0] || line.text });
       continue;
     }
-    const start = raw[i].time;
-    const nextTime = raw[i + 1]?.time;
+
+    const start = line.time;
+    const nextTime = lines[i + 1]?.time;
     const span =
       nextTime != null && nextTime > start
         ? nextTime - start
         : Math.max(phrases.length * 1.8, 2);
+
+    const timed = splitByWords(line, phrases);
+    if (timed) {
+      if (line.translation) timed[0].translation = line.translation;
+      out.push(...timed);
+      continue;
+    }
+
     phrases.forEach((phrase, j) => {
-      out.push({
-        time: start + (span * j) / phrases.length,
-        text: phrase,
-      });
+      const row: LyricLine = { time: start + (span * j) / phrases.length, text: phrase };
+      // A translation covers the whole source row — keep it on the first only.
+      if (j === 0 && line.translation) row.translation = line.translation;
+      out.push(row);
     });
   }
   return out;
@@ -151,8 +193,8 @@ function attachTimed(
  * Parse LRC into timed lines.
  * Handles classic `[t]text`, multi-tag `[t1][t2]text`, inline `[t1]a [t2]b`,
  * bilingual translations, and word-level (karaoke) timings.
- * Chinese phrases joined by spaces become separate display lines — but only when
- * there is nothing time-aligned to them, since splitting would break the merge.
+ * Chinese phrases joined by spaces become separate display lines; karaoke word
+ * timings are cut at the same boundaries so highlighting stays in sync.
  */
 export function parseLrc(
   raw?: string | null,
@@ -164,7 +206,6 @@ export function parseLrc(
 
   const translations = extra?.translation ? parseRawTimedLines(extra.translation) : [];
   const wordLines = extra?.words ? parseWordLines(extra.words) : [];
-  if (!translations.length && !wordLines.length) return expandTimedPhrases(base);
 
   if (translations.length) {
     attachTimed(base, translations, 0.35, (line, src) => {
@@ -182,7 +223,7 @@ export function parseLrc(
     });
   }
 
-  return base;
+  return splitPhrases(base);
 }
 
 export function formatTime(sec: number): string {
