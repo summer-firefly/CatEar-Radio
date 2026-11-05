@@ -27,6 +27,43 @@ fn send_playback_command(app: &tauri::AppHandle, action: &str) {
     let _ = app.emit(PLAYBACK_COMMAND, action);
 }
 
+/// Append panics to `<app data>/maoer-radio/panic.log` so a release build,
+/// which has no reachable stderr, still leaves a trace behind.
+fn install_panic_logger(data_dir: &std::path::Path) {
+    use std::io::Write;
+
+    let log_path = data_dir.join("panic.log");
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let message = match info.payload().downcast_ref::<&str>() {
+            Some(text) => (*text).to_string(),
+            None => info
+                .payload()
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "non-string panic payload".to_string()),
+        };
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let line = format!(
+            "[{}] thread '{thread}' panicked at {location}: {message}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+        eprintln!("{line}");
+    }));
+}
+
 #[cfg(desktop)]
 fn setup_desktop(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -255,6 +292,7 @@ pub fn run() {
                 .expect("app data dir")
                 .join("maoer-radio");
             std::fs::create_dir_all(&data_dir).ok();
+            install_panic_logger(&data_dir);
 
             let settings = SettingsStore::load(data_dir.join("settings.json"));
             // Seed bundled netease/qq/kuwo; enable them if settings still have none selected.

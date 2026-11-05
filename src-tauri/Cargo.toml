@@ -36,5 +36,7 @@ tauri-plugin-global-shortcut = "2"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Keep unwinding so a panic inside a spawned task (custom protocol responder,
+# background sync, …) kills only that task instead of the whole process.
+panic = "unwind"
 strip = true
