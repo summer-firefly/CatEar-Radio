@@ -74,6 +74,18 @@ pub fn write(
         .map_err(|e| e.to_string())
 }
 
+/// Lyrics embedded by `write`, so a downloaded track plays with subtitles even
+/// when the source cannot be reached.
+pub fn read_lyrics(path: &Path) -> Option<String> {
+    let tagged = lofty::read_from_path(path).ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    tag.get_string(ItemKey::UnsyncLyrics)
+        .or_else(|| tag.get_string(ItemKey::Lyrics))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +150,9 @@ mod tests {
         assert_eq!(tag.pictures().len(), 1);
         let lyrics = tag.get_string(ItemKey::UnsyncLyrics);
         assert!(lyrics.is_some_and(|text| text.contains("一群嗜血的蚂蚁")));
+        // Offline playback reads lyrics back out of the file itself.
+        let read_back = read_lyrics(&path).expect("lyrics readable from the tag");
+        assert!(read_back.contains("一群嗜血的蚂蚁"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

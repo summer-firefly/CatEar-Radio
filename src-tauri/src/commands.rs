@@ -258,6 +258,37 @@ pub async fn search_tracks(
         .await
 }
 
+/// Cover saved beside the audio file, so artwork needs no network either.
+fn find_local_cover(audio: &Path) -> Option<PathBuf> {
+    let stem = audio.file_stem()?.to_str()?.to_string();
+    ["jpg", "jpeg", "png", "webp", "gif"]
+        .iter()
+        .map(|ext| audio.with_file_name(format!("{stem}.{ext}")))
+        .find(|path| path.is_file())
+}
+
+/// Rebuild a track around its downloaded copy: audio, lyrics and cover all
+/// come from disk.
+fn local_track(track: Track, audio: PathBuf) -> Track {
+    let cover = find_local_cover(&audio)
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| track.cover.clone());
+    let lrc = track
+        .lrc
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| crate::tags::read_lyrics(&audio));
+    Track {
+        audio_url: Some(audio.to_string_lossy().into_owned()),
+        cover,
+        lrc,
+        details_loaded: true,
+        quality: Some("local".into()),
+        quality_label: Some("本地".into()),
+        ..track
+    }
+}
+
 #[tauri::command]
 pub async fn ensure_playable(
     app: AppHandle,
@@ -282,30 +313,24 @@ pub async fn ensure_playable(
 
     let settings = state.settings.get();
     let dir = resolve_download_dir(&app, &settings);
-    let quality = crate::model::AudioQuality::from_id(&settings.quality);
 
+    // A downloaded copy already holds the audio, lyrics and artwork, so play it
+    // straight from disk instead of asking the source again.
+    if let Some(local) = find_local_audio(&dir, &track) {
+        return Ok(local_track(track, local));
+    }
+
+    let quality = crate::model::AudioQuality::from_id(&settings.quality);
     let (_, sources) = load_sources(&app, &settings);
-    // Always resolve details (lyrics etc.); local file only overrides the audio URL.
-    let mut out = state
+    let out = state
         .music
         .ensure_playable(&sources, track.clone(), quality)
         .await;
-    if let Some(local) = find_local_audio(&dir, &track) {
-        out.title = if out.title.trim().is_empty() {
-            track.title.clone()
-        } else {
-            out.title
-        };
-        out.artist = if out.artist.trim().is_empty() {
-            track.artist.clone()
-        } else {
-            out.artist
-        };
-        out.cover = out.cover.or(track.cover.clone());
-        out.audio_url = Some(local.to_string_lossy().into_owned());
-        out.details_loaded = true;
-        out.quality = Some("local".into());
-        out.quality_label = Some("本地".into());
+
+    // A stored title / artist can be stale; the file was named from the richer
+    // metadata, so look once more before giving up on the local copy.
+    if let Some(local) = find_local_audio(&dir, &out) {
+        return Ok(local_track(out, local));
     }
     Ok(out)
 }
@@ -582,6 +607,17 @@ pub async fn download_track(
     // Tag the file so it shows artist/album/cover outside the app. A failure
     // here leaves a perfectly playable file, so it never aborts the download.
     let cover = fetch_download_cover(state.inner(), &detailed).await;
+    if let Some((bytes, ext)) = cover.as_ref().filter(|(bytes, _)| !bytes.is_empty()) {
+        // Keep the artwork beside the audio: offline playback then needs neither
+        // the CDN nor the cover cache.
+        let sidecar = path.with_file_name(format!(
+            "{}.{ext}",
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("cover")
+        ));
+        if let Err(e) = std::fs::write(&sidecar, bytes) {
+            eprintln!("write cover sidecar failed for {}: {e}", sidecar.to_string_lossy());
+        }
+    }
     if let Err(e) = crate::tags::write(&path, &detailed, cover) {
         eprintln!("write tags failed for {}: {e}", path.to_string_lossy());
     }
@@ -759,6 +795,11 @@ pub async fn fetch_cover(
     if trimmed.is_empty() {
         return Err("缺少封面地址".into());
     }
+    // Artwork of a downloaded track sits next to its audio file — read it
+    // straight from disk instead of asking the CDN.
+    if let Some(data) = local_cover_data_url(trimmed) {
+        return Ok(data);
+    }
     let variant = crate::cover::CoverVariant::parse(&variant);
     // Ask the CDN for a right-sized render before caching, so a 40px row does
     // not download an 800px JPEG.
@@ -772,6 +813,23 @@ pub async fn fetch_cover(
         "data:image/{ext};base64,{}",
         base64_encode(&bytes)
     ))
+}
+
+/// Data URL for a cover file on disk, if `url` happens to be one.
+fn local_cover_data_url(url: &str) -> Option<String> {
+    let path = Path::new(url);
+    if !path.is_file() {
+        return None;
+    }
+    let mime = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "jpeg",
+        "png" => "png",
+        "webp" => "webp",
+        "gif" => "gif",
+        _ => return None,
+    };
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("data:image/{mime};base64,{}", base64_encode(&bytes)))
 }
 
 const B64_TABLE: &[u8; 64] =
