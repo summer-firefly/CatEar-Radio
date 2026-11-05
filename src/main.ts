@@ -164,6 +164,7 @@ function loadRecent(): Track[] {
     return parsed
       .filter((x): x is Record<string, unknown> => !!x && typeof x === "object" && typeof (x as { uid?: unknown }).uid === "string")
       .map((x) => storedToTrack(x as LibrarySnapshot["favorites"][number]))
+      .filter(trackIdConsistent)
       .slice(0, RECENT_MAX);
   } catch {
     return [];
@@ -192,7 +193,10 @@ function compactTrack(t: Track): Track {
 
 function persistRecent(tracks: Track[]) {
   try {
-    localStorage.setItem(RECENT_KEY, JSON.stringify(tracks.slice(0, RECENT_MAX).map(compactTrack)));
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify(tracks.slice(0, RECENT_MAX).filter(trackIdConsistent).map(compactTrack)),
+    );
   } catch {
     /* ignore quota */
   }
@@ -222,12 +226,17 @@ function loadSession(): StoredSession | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<StoredSession> | null;
     if (!parsed || !Array.isArray(parsed.queue) || !parsed.queue.length) return null;
-    const queue = parsed.queue
+    const stored = parsed.queue
       .filter((x): x is Track => !!x && typeof x === "object" && typeof (x as Track).uid === "string")
       .map((x) => compactTrack(x))
       .slice(0, SESSION_QUEUE_MAX);
+    if (!stored.length) return null;
+    const storedIndex = Math.min(Math.max(0, Number(parsed.queueIndex) || 0), stored.length - 1);
+    const queue = stored.filter(trackIdConsistent);
     if (!queue.length) return null;
-    const index = Math.min(Math.max(0, Number(parsed.queueIndex) || 0), queue.length - 1);
+    // Keep pointing at the same song even when poisoned entries get dropped.
+    const droppedBefore = stored.slice(0, storedIndex).filter((t) => !trackIdConsistent(t)).length;
+    const index = Math.min(Math.max(0, storedIndex - droppedBefore), queue.length - 1);
     const mode = parsed.playMode === "single" || parsed.playMode === "shuffle" ? parsed.playMode : "list";
     return {
       queue,
@@ -365,6 +374,10 @@ const state = {
   /** Client-side pages for local lists (hot / favorites / recommend playlist browse). */
   hotPage: 1,
   favPage: 1,
+  /** Local filter typed into the favourites pane. */
+  favQuery: "",
+  /** uids ticked for a batch download in the favourites pane. */
+  favSelected: new Set<string>(),
   recentPage: 1,
   browsePlaylistId: null as string | null,
   browsePage: 1,
@@ -1072,7 +1085,7 @@ function eqGainLabel(db: number): string {
 
 function eqPanelHtml(): string {
   return `
-    <div class="settings-card">
+    <div class="settings-card eq-card">
       <div class="eq-head">
         <h3>均衡器</h3>
         <button class="btn ghost sm" id="btn-eq-toggle" type="button" aria-pressed="${state.eq.enabled}">${
@@ -1099,11 +1112,11 @@ function eqPanelHtml(): string {
         }).join("")}
       </div>
       <div class="eq-preamp">
-        <span class="hint">前级</span>
+        <span class="eq-preamp-label">前级</span>
         <input type="range" id="eq-preamp" min="-${EQ_GAIN_RANGE}" max="${EQ_GAIN_RANGE}" step="0.5" value="${
           state.eq.preamp
         }" aria-label="前级增益" />
-        <span class="hint" id="eq-preamp-value">${eqGainLabel(state.eq.preamp)}</span>
+        <span class="eq-preamp-value" id="eq-preamp-value">${eqGainLabel(state.eq.preamp)}</span>
       </div>
       <p class="settings-hint">${
         state.eq.enabled
@@ -1196,6 +1209,8 @@ const ICO = {
   prev: iconSvg(`<path d="M6 5h2.4v14H6z"/><path d="M20 5v14L9.8 12z"/>`, true),
   next: iconSvg(`<path d="M15.6 5H18v14h-2.4z"/><path d="M4 5v14l10.2-7z"/>`, true),
   note: iconSvg(`<path d="${MUSIC_NOTE_PATH}"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>`),
+  check: iconSvg(`<path d="m5 12.5 4.6 4.5L19 6.8"/>`),
+  search: iconSvg(`<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.2 4.2"/>`),
   spinner: `<svg class="spin" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5" stroke-dasharray="14 40"/></svg>`,
 };
 
@@ -1639,8 +1654,7 @@ function goLocalListPage(key: string, delta: number) {
     const total = state.recommend?.hotTracks.length ?? 0;
     state.hotPage = clampPage(state.hotPage + delta, total, pageSize);
   } else   if (key === "fav") {
-    const total = state.library?.favorites.length ?? 0;
-    state.favPage = clampPage(state.favPage + delta, total, pageSize);
+    state.favPage = clampPage(state.favPage + delta, filteredFavorites().length, pageSize);
   } else if (key === "recent") {
     state.recentPage = clampPage(state.recentPage + delta, state.recent.length, pageSize);
   } else if (key === "browse") {
@@ -1662,7 +1676,7 @@ function goLocalListPage(key: string, delta: number) {
 function syncLocalPagesToSize() {
   const pageSize = calcListPageSize();
   state.hotPage = clampPage(state.hotPage, state.recommend?.hotTracks.length ?? 0, pageSize);
-  state.favPage = clampPage(state.favPage, state.library?.favorites.length ?? 0, pageSize);
+  state.favPage = clampPage(state.favPage, filteredFavorites().length, pageSize);
   state.recentPage = clampPage(state.recentPage, state.recent.length, pageSize);
   const pl = browsingPlaylist();
   state.browsePage = clampPage(state.browsePage, pl?.tracks.length ?? 0, pageSize);
@@ -2573,7 +2587,7 @@ function tracksForDownloadKey(key: string): Track[] {
   if (key === "search") return state.searchTracks;
   if (key === "detail") return state.detail?.tracks ?? [];
   if (key === "hot") return state.recommend?.hotTracks ?? [];
-  if (key === "fav") return (state.library?.favorites ?? []).map(storedToTrack);
+  if (key === "fav") return filteredFavorites();
   if (key === "recent") return state.recent;
   if (key.startsWith("rec-")) {
     const id = key.slice(4);
@@ -2890,7 +2904,10 @@ function queueFromKey(key: string): Track[] {
   }
   if (key === "detail") return state.detail?.tracks.slice() ?? [];
   if (key === "hot") return state.recommend?.hotTracks ?? [];
-  if (key === "fav") return (state.library?.favorites ?? []).map(storedToTrack);
+  if (key === "fav") {
+    // Respect the pane's filter: play / download only what the user can see.
+    return filteredFavorites();
+  }
   if (key === "recent") return state.recent.slice();
   if (key === "local") return state.localTracks.slice();
   if (key === "browse") {
@@ -3410,7 +3427,26 @@ function storedToTrack(s: LibrarySnapshot["favorites"][number]): Track {
   };
 }
 
-function trackRow(track: Track, index: number, queueKey = "", listLen = 0, altCount = 0, groupKey = "") {
+/**
+ * `uid` embeds the source-side song id (`kuwo-MUSIC_123` → `MUSIC_123`),
+ * so a track whose recorded `songId` disagrees with it was rebuilt from
+ * another song's payload. Keeping such an entry around makes every later
+ * click on that row resolve to the wrong song.
+ */
+function trackIdConsistent(t: Track): boolean {
+  if (t.source === "local" || !t.songId) return true;
+  return t.uid === `${t.source}-${t.songId}`;
+}
+
+function trackRow(
+  track: Track,
+  index: number,
+  queueKey = "",
+  listLen = 0,
+  altCount = 0,
+  groupKey = "",
+  pick = false,
+) {
   const active = state.current?.uid === track.uid;
   const idx = String(index + 1).padStart(2, "0");
   const dlBusy = state.downloadingUid === track.uid;
@@ -3427,9 +3463,18 @@ function trackRow(track: Track, index: number, queueKey = "", listLen = 0, altCo
           SOURCE_LABEL[track.source] || track.source,
         )} +${altCount}${state.searchGroupOpen.has(groupKey) ? " −" : ""}</span>`
       : `<span class="badge">${escapeHtml(SOURCE_LABEL[track.source] || track.source)}</span>`;
+  const picked = pick && state.favSelected.has(track.uid);
+  // Selection mode trades the row number for a tick box — no extra grid column.
+  const leadCell = pick
+    ? `<span class="pick${picked ? " is-checked" : ""}" data-pick-uid="${escapeAttr(
+        track.uid,
+      )}" role="checkbox" aria-checked="${picked}" title="选择这首歌">${ICO.check}</span>`
+    : `<span class="idx" data-idx="${idx}">${active && state.playing ? "♪" : idx}</span>`;
   return `
-    <button class="track-row ${active ? "active" : ""}" type="button" data-play-uid="${escapeAttr(track.uid)}">
-      <span class="idx" data-idx="${idx}">${active && state.playing ? "♪" : idx}</span>
+    <button class="track-row ${active ? "active" : ""}${picked ? " is-picked" : ""}" type="button" data-play-uid="${escapeAttr(
+      track.uid,
+    )}">
+      ${leadCell}
       <img class="cover" src="${coverPlaceholder()}"${coverAttrs(track)} alt="" loading="lazy" decoding="async" />
       <div class="meta">
         <div class="title">${escapeHtml(track.title || "未知歌曲")}</div>
@@ -3503,6 +3548,7 @@ function trackList(
   queueKey: string,
   startIndex = 0,
   group = false,
+  pick = false,
 ): string {
   if (!tracks.length) return emptyState("♪", "暂无歌曲", "换个关键词或稍后再试");
   const rows = group
@@ -3524,11 +3570,13 @@ function trackList(
           return primary + alts;
         })
         .join("")
-    : tracks.map((t, i) => trackRow(t, startIndex + i, queueKey, startIndex + tracks.length)).join("");
+    : tracks
+        .map((t, i) => trackRow(t, startIndex + i, queueKey, startIndex + tracks.length, 0, "", pick))
+        .join("");
   return `
     <div class="track-list" data-queue="${escapeAttr(queueKey)}">
       <div class="track-list-head">
-        <span>#</span><span></span><span>歌曲</span><span class="col-artist">歌手</span><span>来源</span><span></span>
+        <span>${pick ? "选" : "#"}</span><span></span><span>歌曲</span><span class="col-artist">歌手</span><span>来源</span><span></span>
       </div>
       ${rows}
     </div>
@@ -3737,10 +3785,55 @@ function trackSkeleton(count: number): string {
   `;
 }
 
+/** Favourites narrowed by the pane's own search box — pinyin aware. */
+function filteredFavorites(): Track[] {
+  const all = (state.library?.favorites ?? []).map(storedToTrack);
+  const q = state.favQuery.trim();
+  if (!q) return all;
+  return all.filter((t) => matchesAnyField([t.title, t.artist, t.album], q));
+}
+
+/** Show "共 N 首" normally, "M / N 首" while a filter is narrowing the list. */
+function favsQueryHint(matched: number, total: number): string {
+  if (!state.favQuery.trim() || matched === total) return `共 ${total} 首`;
+  return `${matched} / ${total} 首`;
+}
+
+/** Batch-download the ticked favourites, keeping only what is still visible. */
+function downloadSelectedFavorites() {
+  const pool = filteredFavorites();
+  downloadTracks(pool.filter((t) => state.favSelected.has(t.uid)));
+}
+
+/** Ticks that are both selected and currently visible through the filter. */
+function pickedFavCount(all = filteredFavorites()): number {
+  let n = 0;
+  for (const t of all) if (state.favSelected.has(t.uid)) n += 1;
+  return n;
+}
+
+/** Refresh the favourites pick bar in place after ticking a row. */
+function patchFavPickBar() {
+  const bar = document.querySelector(".pick-bar");
+  if (!bar) return;
+  const all = filteredFavorites();
+  const picked = pickedFavCount(all);
+  const counter = bar.querySelector(".hint");
+  if (counter) counter.textContent = `已选 ${picked} / ${all.length} 首`;
+  const toggle = bar.querySelector<HTMLButtonElement>("[data-pick-all]");
+  if (toggle) toggle.textContent = picked === all.length && all.length > 0 ? "取消全选" : "全选";
+  const btn = bar.querySelector<HTMLButtonElement>("[data-pick-download]");
+  if (btn) btn.disabled = picked === 0;
+}
+
 function renderLibrary(): string {
-  const favsAll = (state.library?.favorites ?? []).map(storedToTrack);
+  const favsAll = filteredFavorites();
   const favs = slicePage(favsAll, state.favPage, calcListPageSize());
   state.favPage = favs.page;
+  // Drop ticks whose song is gone from the library, but keep ticks hidden by
+  // the search filter so a narrower query does not lose the selection.
+  const liveUids = new Set((state.library?.favorites ?? []).map((t) => t.uid));
+  state.favSelected = new Set([...state.favSelected].filter((uid) => liveUids.has(uid)));
   const recent = slicePage(state.recent, state.recentPage, calcListPageSize());
   state.recentPage = recent.page;
   const playlists = state.library?.playlists ?? [];
@@ -3751,7 +3844,7 @@ function renderLibrary(): string {
       <div class="lib-toolbar">
         <div class="lib-tabs" role="tablist">
           <button type="button" class="lib-tab ${pane === "favorites" ? "active" : ""}" data-lib-pane="favorites" role="tab" aria-selected="${pane === "favorites"}">
-            喜欢 · ${favsAll.length}
+            喜欢 · ${state.library?.favorites.length ?? 0}
           </button>
           <button type="button" class="lib-tab ${pane === "recent" ? "active" : ""}" data-lib-pane="recent" role="tab" aria-selected="${pane === "recent"}">
             最近 · ${state.recent.length}
@@ -3772,22 +3865,43 @@ function renderLibrary(): string {
         pane === "favorites"
           ? `<section class="lib-pane">
               ${
-                favsAll.length
+                state.library?.favorites.length
                   ? `<div class="section-head compact">
                       <h2>我喜欢</h2>
                       <div class="section-actions">
-                        ${
-                          renderPager({
-                            key: "fav",
-                            page: favs.page,
-                            totalPages: favs.totalPages,
-                            ariaLabel: "我喜欢分页",
-                          }) || `<span class="hint">共 ${favs.total} 首</span>`
-                        }
-                        ${downloadAllButton("fav")}
+                        <label class="pane-search">
+                          ${ICO.search}
+                          <input type="search" id="fav-search" placeholder="搜索歌名 / 歌手 / 专辑" value="${escapeAttr(
+                            state.favQuery,
+                          )}" aria-label="搜索我喜欢的歌曲" />
+                        </label>
+                        <span class="hint">${favsQueryHint(favs.total, favsAll.length)}</span>
+                        ${renderPager({
+                          key: "fav",
+                          page: favs.page,
+                          totalPages: favs.totalPages,
+                          ariaLabel: "我喜欢分页",
+                        })}
+                        ${downloadAllButton(
+                          "fav",
+                          state.favQuery.trim() ? "下载筛选结果" : "全部下载",
+                        )}
                       </div>
                     </div>
-                    ${trackList(favs.items, "fav", favs.startIndex)}`
+                    ${
+                      favsAll.length
+                        ? `<div class="pick-bar">
+                            <button class="btn ghost sm" type="button" data-pick-all="fav">
+                              ${pickedFavCount(favsAll) === favsAll.length ? "取消全选" : "全选"}
+                            </button>
+                            <span class="hint">已选 ${pickedFavCount(favsAll)} / ${favsAll.length} 首</span>
+                            <button class="btn sm" type="button" data-pick-download="fav" ${
+                              pickedFavCount(favsAll) ? "" : "disabled"
+                            }>下载所选</button>
+                          </div>
+                          ${trackList(favs.items, "fav", favs.startIndex, false, true)}`
+                        : emptyState("⌕", "没有匹配的歌曲", "换个关键词试试，或清空搜索框")
+                    }`
                   : emptyState("♡", "还没有收藏", "去发现页点红心，喜欢的歌会出现在这里")
               }
             </section>`
@@ -4056,14 +4170,16 @@ function renderSettings(): string {
       }
       <div class="settings-card settings-inline">
         <h3>缓存占用</h3>
-        <span class="hint" id="cache-stats">${escapeHtml(cacheStatsText())}</span>
-        <button class="btn ghost sm" id="btn-clear-cache" type="button">清理缓存</button>
+        <div class="settings-tail">
+          <span class="hint" id="cache-stats">${escapeHtml(cacheStatsText())}</span>
+          <button class="btn ghost sm" id="btn-clear-cache" type="button">清理缓存</button>
+        </div>
       </div>
       ${eqPanelHtml()}
-      <div class="settings-card">
+      <div class="settings-card settings-inline update-card">
         <h3>版本更新</h3>
-        <span class="hint" id="update-status">${escapeHtml(updateStatusText())}</span>
-        <div class="path-row">
+        <div class="settings-tail">
+          <span class="update-status" id="update-status">${escapeHtml(updateStatusText())}</span>
           <button class="btn ghost sm" id="btn-check-update" type="button" ${
             state.checkingUpdate ? "disabled" : ""
           }>${state.checkingUpdate ? "检查中…" : "检查更新"}</button>
@@ -4754,6 +4870,22 @@ function bindMainEvents() {
         void movePlaylistTrack(playlistId, fromIndex, toIndex);
         return;
       }
+      if (target.closest("[data-pick-uid]")) {
+        e.preventDefault();
+        e.stopPropagation();
+        const cell = target.closest("[data-pick-uid]") as HTMLElement;
+        const uid = cell.dataset.pickUid!;
+        const picked = !state.favSelected.has(uid);
+        if (picked) state.favSelected.add(uid);
+        else state.favSelected.delete(uid);
+        // Patch the row and the bar instead of re-rendering — keeps covers
+        // from reloading while ticking a long list.
+        cell.classList.toggle("is-checked", picked);
+        cell.setAttribute("aria-checked", String(picked));
+        row.classList.toggle("is-picked", picked);
+        patchFavPickBar();
+        return;
+      }
       if (target.closest("[data-dl-uid]")) {
         e.preventDefault();
         e.stopPropagation();
@@ -4763,10 +4895,16 @@ function bindMainEvents() {
         return;
       }
       const uid = row.dataset.playUid!;
-      const track = findTrack(uid);
-      if (track) {
-        const key = queueKeyFor(row);
-        void playTrack(track, queueFor(row), queueKindFor(key));
+      const key = queueKeyFor(row);
+      const list = queueFor(row);
+      // Resolve from the row's own list first: a stale "recent" copy of the
+      // same uid may carry another song's id and would hijack the click.
+      const track = list.find((t) => t.uid === uid) ?? findTrack(uid);
+      if (!track) return;
+      if (list.some((t) => t.uid === uid)) {
+        void playTrack(track, list, queueKindFor(key));
+      } else {
+        void playTrack(track, undefined, queueKindFor(key));
       }
     });
     row.addEventListener("contextmenu", (e) => {
@@ -4791,6 +4929,40 @@ function bindMainEvents() {
       }
       downloadTracks(tracks);
     });
+  });
+
+  // Favourites pane: local filter + tick-box batch download.
+  const favSearch = document.querySelector<HTMLInputElement>("#fav-search");
+  const applyFavFilter = (value: string, caret?: number) => {
+    state.favQuery = value;
+    state.favPage = 1;
+    renderMain();
+    // The rerender replaces the input; put focus and caret back where they were.
+    const next = document.querySelector<HTMLInputElement>("#fav-search");
+    if (next) {
+      next.focus();
+      const pos = caret ?? next.value.length;
+      next.setSelectionRange(pos, pos);
+    }
+  };
+  favSearch?.addEventListener("input", (e) => {
+    // Rerendering mid-composition would drop the IME candidate window.
+    if ((e as InputEvent).isComposing) return;
+    applyFavFilter(favSearch.value, favSearch.selectionStart ?? undefined);
+  });
+  favSearch?.addEventListener("compositionend", () => applyFavFilter(favSearch.value));
+
+  document.querySelector("[data-pick-all]")?.addEventListener("click", () => {
+    const all = filteredFavorites();
+    const everyPicked = all.length > 0 && all.every((t) => state.favSelected.has(t.uid));
+    state.favSelected = new Set(everyPicked ? [] : all.map((t) => t.uid));
+    renderMain();
+  });
+
+  document.querySelector("[data-pick-download]")?.addEventListener("click", () => {
+    downloadSelectedFavorites();
+    state.favSelected.clear();
+    renderMain();
   });
 
   document.querySelector("#btn-new-playlist")?.addEventListener("click", () => openNewPlaylistDialog());
